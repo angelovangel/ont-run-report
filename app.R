@@ -13,6 +13,10 @@ script_path <- Sys.getenv('SCRIPT_PATH', unset = '/usr/local/bin/generate-ont-re
 
 app_tmp_dir <- file.path(getwd(), "tmp")
 dir.create(app_tmp_dir, showWarnings = FALSE, recursive = TRUE)
+addResourcePath("reports", app_tmp_dir)
+
+# Clean up any leftover run artifacts from a previous app run
+unlink(list.files(app_tmp_dir, pattern = "^run_", full.names = TRUE), recursive = TRUE)
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -39,7 +43,7 @@ sidebar <- sidebar(
           tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
                   "Title shown at the top of the generated HTML report.", placement = "right")
         ),
-        value = 'ONT Sequencing Report'),
+        value = 'ONT Run Report'),
 
       numericInput('sample_hz',
         label = tags$span(
@@ -48,13 +52,6 @@ sidebar <- sidebar(
                   "Sampling interval for the Active-Pores chart in minutes.", placement = "right")
         ),
         value = 5, min = 1, max = 60, step = 1)
-    ),
-
-    div(class = "d-flex gap-2 mt-1",
-      shinyjs::disabled(
-        actionButton('start', 'Generate Report', class = 'btn-success flex-fill')
-      ),
-      actionButton('reset', 'Reset', class = 'flex-shrink-0')
     )
   )
 )
@@ -72,6 +69,12 @@ ui <- page_navbar(
   nav_panel(
     use_busy_spinner(spin = "double-bounce", position = 'top-right', color = '#E67E22'),
     title = 'Generate Report',
+    div(class = "d-flex gap-2 mb-2",
+      shinyjs::disabled(
+        actionButton('start', 'Generate Report', class = 'btn-success flex-fill')
+      ),
+      actionButton('reset', 'Reset', class = 'flex-shrink-0')
+    ),
     layout_column_wrap(
       width = NULL, fill = TRUE, gap = '0.5rem',
       style = htmltools::css(grid_template_columns = "1fr"),
@@ -89,10 +92,7 @@ ui <- page_navbar(
         div(id = 'download_panel',
           card(
             card_header(class = 'py-1 small fw-semibold', 'Report ready'),
-            card_body(class = 'p-2',
-              downloadButton('download_report', 'Download HTML Report',
-                             class = 'btn-primary', style = 'width:100%')
-            )
+            card_body(class = 'p-2', uiOutput('report_link_ui'))
           )
         )
       )
@@ -129,6 +129,7 @@ server <- function(input, output, session) {
     log_file    = NULL,
     status_file = NULL,
     report_file = NULL,
+    report_url  = NULL,
     is_running  = FALSE,
     show_log    = FALSE
   )
@@ -250,15 +251,16 @@ server <- function(input, output, session) {
     isolate({
       rv$is_running <- FALSE
       shinyjs::enable('controls')
+      shinyjs::enable('reset')
       shinyjs::html(id = 'start', 'Generate Report')
       hide_spinner()
       if (status == "0") {
         sendSweetAlert(title = NULL, text = "Report generated successfully!",
-                       type = "success", btn_labels = NA, closeOnClickOutside = TRUE)
+                       type = "success", btn_labels = NA, closeOnClickOutside = TRUE, showCloseButton = TRUE)
         shinyjs::show('download_panel')
       } else {
         sendSweetAlert(title = "Error", text = "Report generation failed! Check the terminal output.",
-                       type = "error", btn_labels = "OK")
+                       type = "error", btn_labels = "OK", showCloseButton = TRUE)
       }
     })
   })
@@ -276,6 +278,7 @@ server <- function(input, output, session) {
     log_file     <- file.path(app_tmp_dir, paste0("run_", run_id, ".log"))
     status_file  <- file.path(app_tmp_dir, paste0("run_", run_id, ".status"))
     report_file  <- file.path(work_dir, "report.html")
+    report_url   <- file.path("reports", basename(work_dir), "report.html")
     inner_script <- file.path(app_tmp_dir, paste0("run_", run_id, ".sh"))
 
     pa_paths <- character(n); tp_paths <- character(n); lbl_args <- character(n)
@@ -323,26 +326,28 @@ server <- function(input, output, session) {
     rv$log_file    <- log_file
     rv$status_file <- status_file
     rv$report_file <- report_file
+    rv$report_url  <- report_url
     rv$is_running  <- TRUE
     rv$show_log    <- TRUE
 
     shinyjs::disable('controls')
+    shinyjs::disable('reset')
     shinyjs::html(id = 'start', 'Generating...')
     shinyjs::hide('download_panel')
     show_spinner()
   })
 
   # ---------------------------------------------------------------------------
-  # Download
+  # Report link (opens the generated HTML report in a new tab)
   # ---------------------------------------------------------------------------
-  output$download_report <- downloadHandler(
-    filename = function() paste0("ont-report-", format(Sys.time(), "%Y%m%d-%H%M%S"), ".html"),
-    content  = function(file) {
-      rf <- rv$report_file
-      if (!is.null(rf) && file.exists(rf)) file.copy(rf, file)
-    },
-    contentType = "text/html"
-  )
+  output$report_link_ui <- renderUI({
+    req(rv$report_url)
+    tags$a(
+      href = rv$report_url, target = "_blank", rel = "noopener noreferrer",
+      class = "btn btn-primary d-block",
+      bs_icon("box-arrow-up-right", class = "me-1"), "Open HTML Report"
+    )
+  })
 
   # ---------------------------------------------------------------------------
   # Reset
@@ -351,17 +356,19 @@ server <- function(input, output, session) {
     rv$log_file    <- NULL
     rv$status_file <- NULL
     rv$report_file <- NULL
+    rv$report_url  <- NULL
     rv$is_running  <- FALSE
     rv$show_log    <- FALSE
 
     # Clean up tmp files
-    tmp_files <- list.files(app_tmp_dir, pattern = "^run_", full.names = TRUE, recursive = TRUE)
+    tmp_files <- list.files(app_tmp_dir, pattern = "^run_", full.names = TRUE)
     unlink(tmp_files, recursive = TRUE)
 
     updateSelectInput(session,  "num_runs",      selected = 2)
     updateTextInput(session,    "report_title",  value = "ONT Sequencing Report")
     updateNumericInput(session, "sample_hz",     value = 5)
     shinyjs::hide('download_panel')
+    shinyjs::enable('reset')
   })
 }
 
