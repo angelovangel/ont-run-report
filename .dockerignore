@@ -1,0 +1,5 @@
+.Renviron
+tmp
+renv/*
+!renv/activate.R
+!renv/settings.json

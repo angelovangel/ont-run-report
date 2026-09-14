@@ -1,6 +1,12 @@
+.git
+.gitignore
+
 tmp/
 renv/library/
 .Rhistory
 .RData
 *.rds
+*.Rproj
 .Rproj.user
+.Rhistory
+.RData
