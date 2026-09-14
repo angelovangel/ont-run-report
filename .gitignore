@@ -1,0 +1,6 @@
+tmp/
+renv/library/
+.Rhistory
+.RData
+*.rds
+.Rproj.user
