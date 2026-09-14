@@ -10,3 +10,4 @@ renv/library/
 .Rproj.user
 .Rhistory
 .RData
+.DS_Store

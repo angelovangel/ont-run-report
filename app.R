@@ -15,8 +15,14 @@ app_tmp_dir <- file.path(getwd(), "tmp")
 dir.create(app_tmp_dir, showWarnings = FALSE, recursive = TRUE)
 addResourcePath("reports", app_tmp_dir)
 
-# Clean up any leftover run artifacts from a previous app run
-unlink(list.files(app_tmp_dir, pattern = "^run_", full.names = TRUE), recursive = TRUE)
+# Sweep stale run artifacts left behind by crashed/killed sessions (e.g. a
+# session that never fired onSessionEnded). Age-gated so it never deletes
+# files from a run that's still active in another session on app restart.
+stale_run_files <- list.files(app_tmp_dir, pattern = "^run_", full.names = TRUE)
+if (length(stale_run_files)) {
+  age_mins <- as.numeric(difftime(Sys.time(), file.info(stale_run_files)$mtime, units = "mins"))
+  unlink(stale_run_files[age_mins > 60], recursive = TRUE)
+}
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -135,13 +141,30 @@ ui <- page_navbar(
 server <- function(input, output, session) {
 
   rv <- reactiveValues(
-    log_file    = NULL,
-    status_file = NULL,
-    report_file = NULL,
-    report_url  = NULL,
-    is_running  = FALSE,
-    show_log    = FALSE
+    log_file     = NULL,
+    status_file  = NULL,
+    report_file  = NULL,
+    report_url   = NULL,
+    work_dir     = NULL,
+    inner_script = NULL,
+    is_running   = FALSE,
+    show_log     = FALSE
   )
+
+  # Remove only the files/dirs belonging to THIS session. Never glob the
+  # shared app_tmp_dir by pattern - other sessions may have runs in flight
+  # there, and deleting by pattern is what corrupts them.
+  cleanup_session_files <- function() {
+    paths <- c(rv$log_file, rv$status_file, rv$inner_script, rv$work_dir)
+    paths <- paths[!vapply(paths, is.null, logical(1))]
+    if (length(paths)) unlink(paths, recursive = TRUE)
+  }
+
+  # Catch-all: if the user closes the tab/browser without hitting Reset,
+  # clean up this session's run artifacts automatically.
+  session$onSessionEnded(function() {
+    isolate(cleanup_session_files())
+  })
 
   # Check script on startup
   observe({
@@ -382,12 +405,14 @@ server <- function(input, output, session) {
       " 2>&1 </dev/null &"
     ))
 
-    rv$log_file    <- log_file
-    rv$status_file <- status_file
-    rv$report_file <- report_file
-    rv$report_url  <- report_url
-    rv$is_running  <- TRUE
-    rv$show_log    <- TRUE
+    rv$log_file     <- log_file
+    rv$status_file  <- status_file
+    rv$report_file  <- report_file
+    rv$report_url   <- report_url
+    rv$work_dir     <- work_dir
+    rv$inner_script <- inner_script
+    rv$is_running   <- TRUE
+    rv$show_log     <- TRUE
 
     shinyjs::disable('controls')
     shinyjs::disable('reset')
@@ -427,16 +452,16 @@ server <- function(input, output, session) {
   # Reset
   # ---------------------------------------------------------------------------
   observeEvent(input$reset, {
-    rv$log_file    <- NULL
-    rv$status_file <- NULL
-    rv$report_file <- NULL
-    rv$report_url  <- NULL
-    rv$is_running  <- FALSE
-    rv$show_log    <- FALSE
+    cleanup_session_files()
 
-    # Clean up tmp files
-    tmp_files <- list.files(app_tmp_dir, pattern = "^run_", full.names = TRUE)
-    unlink(tmp_files, recursive = TRUE)
+    rv$log_file     <- NULL
+    rv$status_file  <- NULL
+    rv$report_file  <- NULL
+    rv$report_url   <- NULL
+    rv$work_dir     <- NULL
+    rv$inner_script <- NULL
+    rv$is_running   <- FALSE
+    rv$show_log     <- FALSE
 
     updateSelectInput(session,  "num_runs",      selected = 2)
     updateTextInput(session,    "report_title",  value = "ONT Run Report")
