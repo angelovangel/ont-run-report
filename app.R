@@ -28,7 +28,7 @@ if (length(stale_run_files)) {
 # Sidebar
 # ---------------------------------------------------------------------------
 sidebar <- sidebar(
-  title = 'Controls', width = 300, gap = '0.5rem',
+  title = 'Controls', width = 400, gap = '0.5rem',
   div(id = 'controls',
 
     selectInput('num_runs',
@@ -70,10 +70,10 @@ ui <- page_navbar(
   fillable = TRUE,
   title    = 'ONT Run Report',
   theme    = bs_theme(bootswatch = 'yeti', primary = '#2E4053',
-                       font_scale = 0.82, spacer = '0.7rem'),
+                       font_scale = 1.0, spacer = '0.7rem'),
   header   = tags$style(HTML("
     .status-dot {
-      display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+      display: inline-block; width: 12px; height: 12px; border-radius: 50%;
       margin-right: 6px; vertical-align: middle;
     }
     .status-red    { background-color: #e74c3c; }
@@ -205,7 +205,7 @@ server <- function(input, output, session) {
       )
     })
     do.call(accordion, c(
-      list(id = 'flowcell_accordion', open = 'Run 1', multiple = TRUE, class = 'mb-1'),
+      list(id = 'flowcell_accordion', open = FALSE, multiple = TRUE, class = 'mb-1'),
       panels
     ))
   })
@@ -250,6 +250,8 @@ server <- function(input, output, session) {
           ),
           type = "warning", btn_labels = "OK", showCloseButton = TRUE
         )
+      } else if (n_ok == 2) {
+        accordion_panel_close("flowcell_accordion", paste0("Run ", i))
       }
     })
   })
@@ -466,6 +468,14 @@ server <- function(input, output, session) {
     updateSelectInput(session,  "num_runs",      selected = 2)
     updateTextInput(session,    "report_title",  value = "ONT Run Report")
     updateNumericInput(session, "sample_hz",     value = 5)
+    for (i in 1:8) {
+      shinyjs::reset(paste0("pore_activity_", i))
+      shinyjs::reset(paste0("throughput_", i))
+      updateTextInput(session, paste0("label_", i), value = paste0("Run ", i))
+      dot_id <- paste0("status_dot_", i)
+      shinyjs::removeClass(id = dot_id, class = "status-yellow status-green")
+      shinyjs::addClass(id = dot_id, class = "status-red")
+    }
     shinyjs::hide('download_panel')
     shinyjs::enable('reset')
   })
