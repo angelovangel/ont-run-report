@@ -9,7 +9,12 @@ library(commonmark)
 
 source('global.R')
 
-script_path <- Sys.getenv('SCRIPT_PATH', unset = '/usr/local/bin/generate-ont-report.py')
+# Local bin/ scripts take priority; env vars are a fallback for deployment.
+app_dir          <- normalizePath(getwd())
+local_ont  <- file.path(app_dir, 'bin', 'generate-ont-report.py')
+local_hifi <- file.path(app_dir, 'bin', 'generate-hifi-report.py')
+script_path      <- if (file.exists(local_ont))  local_ont  else Sys.getenv('SCRIPT_PATH',      unset = '/usr/local/bin/generate-ont-report.py')
+hifi_script_path <- if (file.exists(local_hifi)) local_hifi else Sys.getenv('HIFI_SCRIPT_PATH', unset = '/usr/local/bin/generate-hifi-report.py')
 
 app_tmp_dir <- file.path(getwd(), "tmp")
 dir.create(app_tmp_dir, showWarnings = FALSE, recursive = TRUE)
@@ -31,13 +36,34 @@ sidebar <- sidebar(
   title = 'Controls', width = 400, gap = '0.5rem',
   div(id = 'controls',
 
-    selectInput('num_runs',
+    # ---- Sequencer type toggle ----
+    radioButtons('seq_type',
       label = tags$span(
-        "Number of flow cells", class = "small fw-semibold",
-        tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
-                "How many ONT flow cells to include in the report.", placement = "right")
+        "Sequencer", class = "small fw-semibold",
+        tooltip(
+          bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
+          tags$span("ONT: pore_activity_*.csv + throughput_*.csv.", tags$br(),
+                    "PacBio HiFi: *run-qc-export*.csv (SMRT Link)."),
+          placement = "left"
+        )
       ),
-      choices = 1:8, selected = 2),
+      choices = c('ONT' = 'ont', 'PacBio HiFi' = 'hifi'),
+      selected = 'ont', inline = TRUE
+    ),
+
+    tags$hr(class = 'my-1'),
+
+    # ---- ONT-only: number of flow cells ----
+    conditionalPanel(
+      condition = "input.seq_type == 'ont'",
+      selectInput('num_runs',
+        label = tags$span(
+          "Number of flow cells", class = "small fw-semibold",
+          tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
+                  "How many ONT flow cells to include in the report.", placement = "left")
+        ),
+        choices = 1:8, selected = 2)
+    ),
 
     uiOutput('file_inputs_ui'),
 
@@ -47,17 +73,21 @@ sidebar <- sidebar(
         label = tags$span(
           "Report title", class = "small fw-semibold",
           tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
-                  "Title shown at the top of the generated HTML report.", placement = "right")
+                  "Title shown at the top of the generated HTML report.", placement = "left")
         ),
         value = 'ONT Run Report'),
 
-      numericInput('sample_hz',
-        label = tags$span(
-          "Sampling (min)", class = "small fw-semibold",
-          tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
-                  "Sampling interval for the Active-Pores chart in minutes.", placement = "right")
-        ),
-        value = 5, min = 1, max = 60, step = 1)
+      # Sampling interval is ONT-only
+      conditionalPanel(
+        condition = "input.seq_type == 'ont'",
+        numericInput('sample_hz',
+          label = tags$span(
+            "Sampling (min)", class = "small fw-semibold",
+            tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
+                    "Sampling interval for the Active-Pores chart in minutes.", placement = "left")
+          ),
+          value = 5, min = 1, max = 60, step = 1)
+      )
     )
   )
 )
@@ -68,7 +98,7 @@ sidebar <- sidebar(
 ui <- page_navbar(
   useShinyjs(),
   fillable = TRUE,
-  title    = 'ONT Run Report',
+  title    = 'TGS Run Report',
   theme    = bs_theme(bootswatch = 'yeti', primary = '#2E4053',
                        font_scale = 1.0, spacer = '0.7rem'),
   header   = tags$style(HTML("
@@ -79,6 +109,7 @@ ui <- page_navbar(
     .status-red    { background-color: #e74c3c; }
     .status-yellow { background-color: #f1c40f; }
     .status-green  { background-color: #2ecc71; }
+    .tooltip-inner { max-width: 340px; }
   ")),
   sidebar  = sidebar,
   nav_panel(
@@ -166,10 +197,27 @@ server <- function(input, output, session) {
     isolate(cleanup_session_files())
   })
 
-  # Check script on startup
+  # When switching sequencer type, reset the report title default
+  observeEvent(input$seq_type, {
+    current_title <- input$report_title %||% ""
+    if (input$seq_type == 'hifi' && current_title %in% c('', 'ONT Run Report')) {
+      updateTextInput(session, 'report_title', value = 'HiFi Sequencing Report')
+    } else if (input$seq_type == 'ont' && current_title %in% c('', 'HiFi Sequencing Report')) {
+      updateTextInput(session, 'report_title', value = 'ONT Run Report')
+    }
+  }, ignoreInit = TRUE)
+
+  # Check scripts on startup
   observe({
     if (!script_exists(script_path)) {
       showNotification('generate-ont-report.py not found or not executable!', type = 'error', duration = NULL)
+    }
+  })
+
+  observe({
+    req(input$seq_type == 'hifi')
+    if (!script_exists(hifi_script_path)) {
+      showNotification('generate-hifi-report.py not found or not executable!', type = 'warning', duration = NULL)
     }
   })
 
@@ -177,37 +225,55 @@ server <- function(input, output, session) {
   # Dynamic file input UI
   # ---------------------------------------------------------------------------
   output$file_inputs_ui <- renderUI({
-    n <- req(as.integer(input$num_runs))
-    panels <- lapply(seq_len(n), function(i) {
-      accordion_panel(
-        value = paste0("Run ", i),
-        title = tagList(
-          tags$span(id = paste0("status_dot_", i), class = "status-dot status-red"),
-          paste0("Run ", i)
-        ),
-        icon = bs_icon("hdd-stack"),
-        textInput(paste0("label_", i), label = "Label", value = paste0("Run ", i)),
-        layout_columns(
-          col_widths = c(6, 6), gap = '0.4rem',
-          fileInput(paste0("pore_activity_", i),
-            label = tags$span("pore_activity", class = "small",
-              tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:3px;cursor:pointer;"),
-                      "pore_activity_*.csv generated by MinKNOW during run.", placement = "right")),
-            accept = ".csv", buttonLabel = "Browse…",
-            placeholder = "CSV"),
-          fileInput(paste0("throughput_", i),
-            label = tags$span("throughput", class = "small",
-              tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:3px;cursor:pointer;"),
-                      "throughput_*.csv generated by MinKNOW during run.", placement = "right")),
-            accept = ".csv", buttonLabel = "Browse…",
-            placeholder = "CSV")
+    seq_type <- input$seq_type %||% 'ont'
+
+    if (seq_type == 'hifi') {
+      # HiFi: single multi-file input for run-qc-export CSVs
+      tagList(
+        fileInput('hifi_files',
+          label = tags$span(
+            "run-qc-export CSV file(s)", class = "small fw-semibold",
+            tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
+                    "One or more *run-qc-export*.csv files exported from SMRT Link.", placement = "right")
+          ),
+          accept = ".csv", buttonLabel = "Browse…",
+          placeholder = "Select CSV file(s)", multiple = TRUE
         )
       )
-    })
-    do.call(accordion, c(
-      list(id = 'flowcell_accordion', open = FALSE, multiple = TRUE, class = 'mb-1'),
-      panels
-    ))
+    } else {
+      # ONT: per-flow-cell accordion with pore_activity + throughput
+      n <- req(as.integer(input$num_runs))
+      panels <- lapply(seq_len(n), function(i) {
+        accordion_panel(
+          value = paste0("Run ", i),
+          title = tagList(
+            tags$span(id = paste0("status_dot_", i), class = "status-dot status-red"),
+            paste0("Run ", i)
+          ),
+          icon = bs_icon("hdd-stack"),
+          textInput(paste0("label_", i), label = "Label", value = paste0("Run ", i)),
+          layout_columns(
+            col_widths = c(6, 6), gap = '0.4rem',
+            fileInput(paste0("pore_activity_", i),
+              label = tags$span("pore_activity", class = "small",
+                tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:3px;cursor:pointer;"),
+                        "pore_activity_*.csv generated by MinKNOW during run.", placement = "right")),
+              accept = ".csv", buttonLabel = "Browse…",
+              placeholder = "CSV"),
+            fileInput(paste0("throughput_", i),
+              label = tags$span("throughput", class = "small",
+                tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:3px;cursor:pointer;"),
+                        "throughput_*.csv generated by MinKNOW during run.", placement = "right")),
+              accept = ".csv", buttonLabel = "Browse…",
+              placeholder = "CSV")
+          )
+        )
+      })
+      do.call(accordion, c(
+        list(id = 'flowcell_accordion', open = FALSE, multiple = TRUE, class = 'mb-1'),
+        panels
+      ))
+    }
   })
 
   # ---------------------------------------------------------------------------
@@ -260,12 +326,18 @@ server <- function(input, output, session) {
   # Enable Start button when all files uploaded
   # ---------------------------------------------------------------------------
   observe({
-    n <- req(as.integer(input$num_runs))
-    all_ready <- all(vapply(seq_len(n), function(i) {
-      pa <- input[[paste0("pore_activity_", i)]]
-      tp <- input[[paste0("throughput_", i)]]
-      !is.null(pa) && nrow(pa) > 0 && !is.null(tp) && nrow(tp) > 0
-    }, logical(1)))
+    seq_type <- input$seq_type %||% 'ont'
+    all_ready <- if (seq_type == 'hifi') {
+      hf <- input$hifi_files
+      !is.null(hf) && nrow(hf) > 0
+    } else {
+      n <- req(as.integer(input$num_runs))
+      all(vapply(seq_len(n), function(i) {
+        pa <- input[[paste0("pore_activity_", i)]]
+        tp <- input[[paste0("throughput_", i)]]
+        !is.null(pa) && nrow(pa) > 0 && !is.null(tp) && nrow(tp) > 0
+      }, logical(1)))
+    }
 
     if (all_ready && !rv$is_running) shinyjs::enable('start')
     else                             shinyjs::disable('start')
@@ -295,24 +367,34 @@ server <- function(input, output, session) {
     if (rv$show_log) {
       cat(poll_log())
     } else {
-      n <- req(as.integer(input$num_runs))
+      seq_type <- input$seq_type %||% 'ont'
       cat("Command Preview:\n\n")
-      cat(sprintf("generate-ont-report.py \\\n"))
-      cat(sprintf("  --title %s \\\n", shQuote(input$report_title %||% "ONT Run Report")))
-      cat(sprintf("  --sample-hz %s \\\n", input$sample_hz %||% 5))
-      cat("  --out report.html \\\n")
-      pa_names  <- character(n); tp_names  <- character(n); lbls <- character(n)
-      for (i in seq_len(n)) {
-        pa  <- input[[paste0("pore_activity_", i)]]
-        tp  <- input[[paste0("throughput_", i)]]
-        lbl <- input[[paste0("label_", i)]]
-        pa_names[i] <- if (!is.null(pa) && nrow(pa) > 0) pa$name[1] else paste0("[pore_activity_", i, ".csv]")
-        tp_names[i] <- if (!is.null(tp) && nrow(tp) > 0) tp$name[1] else paste0("[throughput_",    i, ".csv]")
-        lbls[i]     <- if (nzchar(lbl %||% "")) lbl else paste0("Run ", i)
+      if (seq_type == 'hifi') {
+        hf <- input$hifi_files
+        file_args <- if (!is.null(hf) && nrow(hf) > 0) hf$name else "[run-qc-export.csv ...]"
+        cat("generate-hifi-report.py \\\n")
+        cat(sprintf("  --title %s \\\n", shQuote(input$report_title %||% "HiFi Sequencing Report")))
+        cat("  --out report.html \\\n")
+        cat("  ", paste(shQuote(file_args), collapse = " "), "\n")
+      } else {
+        n <- req(as.integer(input$num_runs))
+        cat(sprintf("generate-ont-report.py \\\n"))
+        cat(sprintf("  --title %s \\\n", shQuote(input$report_title %||% "ONT Run Report")))
+        cat(sprintf("  --sample-hz %s \\\n", input$sample_hz %||% 5))
+        cat("  --out report.html \\\n")
+        pa_names  <- character(n); tp_names  <- character(n); lbls <- character(n)
+        for (i in seq_len(n)) {
+          pa  <- input[[paste0("pore_activity_", i)]]
+          tp  <- input[[paste0("throughput_", i)]]
+          lbl <- input[[paste0("label_", i)]]
+          pa_names[i] <- if (!is.null(pa) && nrow(pa) > 0) pa$name[1] else paste0("[pore_activity_", i, ".csv]")
+          tp_names[i] <- if (!is.null(tp) && nrow(tp) > 0) tp$name[1] else paste0("[throughput_",    i, ".csv]")
+          lbls[i]     <- if (nzchar(lbl %||% "")) lbl else paste0("Run ", i)
+        }
+        cat("  --pore-activity", paste(shQuote(pa_names), collapse = " "), "\\\n")
+        cat("  --throughput",    paste(shQuote(tp_names), collapse = " "), "\\\n")
+        cat("  --labels",        paste(shQuote(lbls),     collapse = " "), "\n")
       }
-      cat("  --pore-activity", paste(shQuote(pa_names), collapse = " "), "\\\n")
-      cat("  --throughput",    paste(shQuote(tp_names), collapse = " "), "\\\n")
-      cat("  --labels",        paste(shQuote(lbls),     collapse = " "), "\n")
     }
   })
 
@@ -353,7 +435,7 @@ server <- function(input, output, session) {
   # Start
   # ---------------------------------------------------------------------------
   observeEvent(input$start, {
-    n <- as.integer(input$num_runs)
+    seq_type <- input$seq_type %||% 'ont'
 
     run_id       <- digest::digest(Sys.time(), algo = 'crc32')
     work_dir     <- file.path(app_tmp_dir, paste0("run_", run_id))
@@ -365,34 +447,54 @@ server <- function(input, output, session) {
     report_url   <- file.path("reports", basename(work_dir), "report.html")
     inner_script <- file.path(app_tmp_dir, paste0("run_", run_id, ".sh"))
 
-    pa_paths <- character(n); tp_paths <- character(n); lbl_args <- character(n)
+    title_arg <- if (nzchar(input$report_title %||% "")) input$report_title else
+      if (seq_type == 'hifi') "HiFi Sequencing Report" else "ONT Run Report"
 
-    for (i in seq_len(n)) {
-      pa  <- input[[paste0("pore_activity_", i)]]
-      tp  <- input[[paste0("throughput_",    i)]]
-      lbl <- input[[paste0("label_",         i)]]
+    if (seq_type == 'hifi') {
+      # ---- HiFi mode ----
+      hf <- input$hifi_files
+      hifi_paths <- vapply(seq_len(nrow(hf)), function(i) {
+        dest <- file.path(work_dir, hf$name[i])
+        file.copy(hf$datapath[i], dest, overwrite = TRUE)
+        dest
+      }, character(1))
 
-      pa_dest <- file.path(work_dir, pa$name[1])
-      tp_dest <- file.path(work_dir, tp$name[1])
-      file.copy(pa$datapath[1], pa_dest, overwrite = TRUE)
-      file.copy(tp$datapath[1], tp_dest, overwrite = TRUE)
+      py_cmd <- paste(
+        "python3", shQuote(hifi_script_path),
+        paste(shQuote(hifi_paths), collapse = " "),
+        "--title", shQuote(title_arg),
+        "--out",   shQuote(report_file)
+      )
+    } else {
+      # ---- ONT mode ----
+      n <- as.integer(input$num_runs)
+      pa_paths <- character(n); tp_paths <- character(n); lbl_args <- character(n)
 
-      pa_paths[i] <- pa_dest
-      tp_paths[i] <- tp_dest
-      lbl_args[i] <- if (nzchar(lbl %||% "")) lbl else paste0("Run ", i)
+      for (i in seq_len(n)) {
+        pa  <- input[[paste0("pore_activity_", i)]]
+        tp  <- input[[paste0("throughput_",    i)]]
+        lbl <- input[[paste0("label_",         i)]]
+
+        pa_dest <- file.path(work_dir, pa$name[1])
+        tp_dest <- file.path(work_dir, tp$name[1])
+        file.copy(pa$datapath[1], pa_dest, overwrite = TRUE)
+        file.copy(tp$datapath[1], tp_dest, overwrite = TRUE)
+
+        pa_paths[i] <- pa_dest
+        tp_paths[i] <- tp_dest
+        lbl_args[i] <- if (nzchar(lbl %||% "")) lbl else paste0("Run ", i)
+      }
+
+      py_cmd <- paste(
+        "python3", shQuote(script_path),
+        "--pore-activity", paste(shQuote(pa_paths), collapse = " "),
+        "--throughput",    paste(shQuote(tp_paths), collapse = " "),
+        "--labels",        paste(shQuote(lbl_args), collapse = " "),
+        "--title",         shQuote(title_arg),
+        "--sample-hz",     as.integer(input$sample_hz),
+        "--out",           shQuote(report_file)
+      )
     }
-
-    title_arg <- if (nzchar(input$report_title %||% "")) input$report_title else "ONT Report"
-
-    py_cmd <- paste(
-      "python3", shQuote(script_path),
-      "--pore-activity", paste(shQuote(pa_paths), collapse = " "),
-      "--throughput",    paste(shQuote(tp_paths), collapse = " "),
-      "--labels",        paste(shQuote(lbl_args), collapse = " "),
-      "--title",         shQuote(title_arg),
-      "--sample-hz",     as.integer(input$sample_hz),
-      "--out",           shQuote(report_file)
-    )
 
     writeLines(c(
       "#!/bin/bash",
@@ -465,9 +567,11 @@ server <- function(input, output, session) {
     rv$is_running   <- FALSE
     rv$show_log     <- FALSE
 
+    updateRadioButtons(session, "seq_type",      selected = 'ont')
     updateSelectInput(session,  "num_runs",      selected = 2)
     updateTextInput(session,    "report_title",  value = "ONT Run Report")
     updateNumericInput(session, "sample_hz",     value = 5)
+    shinyjs::reset('hifi_files')
     for (i in 1:8) {
       shinyjs::reset(paste0("pore_activity_", i))
       shinyjs::reset(paste0("throughput_", i))
