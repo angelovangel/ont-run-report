@@ -12,9 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the Python report-generation script and make it executable
-COPY generate-ont-report.py /usr/local/bin/generate-ont-report.py
-RUN chmod +x /usr/local/bin/generate-ont-report.py
+# Copy the Python report-generation scripts and make them executable
+COPY bin/generate-ont-report.py  /usr/local/bin/generate-ont-report.py
+COPY bin/generate-hifi-report.py /usr/local/bin/generate-hifi-report.py
+RUN chmod +x /usr/local/bin/generate-ont-report.py \
+             /usr/local/bin/generate-hifi-report.py
 
 WORKDIR /app
 
