@@ -297,11 +297,22 @@ def _col_display(rec, col):
     return _fmt_number(col["dec"], val)
 
 
+DOT = '<span style="display:inline-block;width:11px;height:11px;border-radius:50%;background:#9ca3af;margin:0 2px;vertical-align:middle;"></span>'
+
+def _acq_dots(val):
+    """Render acquisition number as 1–N big grey dots (raw HTML)."""
+    if val is None:
+        return "-"
+    n = max(1, min(int(val), 8))  # cap at 8 for safety
+    return DOT * n
+
+
 def render_table_header():
     ths = []
     for col in COLUMNS:
         align = ' style="text-align:right"' if col["type"] == "number" else ""
-        ths.append(f'<th{align} data-type="{col["type"]}" onclick="sortTable(this)">'
+        is_metric = " data-metric=\"true\"" if col.get("metric") else ""
+        ths.append(f'<th{align} data-type="{col["type"]}"{is_metric} onclick="sortTable(this)">'
                    f'{col["label"]}<span class="sort-arrow"></span></th>')
     return "".join(ths)
 
@@ -326,8 +337,12 @@ def render_table_row(rec):
         style_attr = f' style="{";".join(style_parts)}"' if style_parts else ""
         class_attr = f' class="{" ".join(class_parts)}"' if class_parts else ""
 
+        if col["key"] == "acquisition":
+            cell_content = _acq_dots(val)
+        else:
+            cell_content = _html_escape(disp)
         tds.append(f'<td{class_attr}{style_attr} data-value="{_html_escape(data_value)}">'
-                   f'{_html_escape(disp)}</td>')
+                   f'{cell_content}</td>')
 
     row_attrs = (f'data-run="{_html_escape(rec["run_name"])}" '
                 f'data-cell="{_html_escape(rec["cell_id"])}" '
@@ -434,9 +449,14 @@ HTML_TEMPLATE = """\
       cursor:pointer;user-select:none;}}
   th:hover{{background:#e2e8f0;}}
   .sort-arrow{{font-size:10px;color:#4a5568;margin-left:3px;}}
-  td{{padding:8px 11px;border-bottom:1px solid #e9ecef;}}
+  td{{padding:8px 13px 14px;border-bottom:1px solid #e9ecef;position:relative;vertical-align:middle;}}
   tr:last-child td{{border-bottom:none;}}
-  tr:hover td{{background:#f0f4ff;}}
+  tr:hover td{{background:rgba(59,130,246,.04);}}
+  .bar-track{{position:absolute;bottom:4px;left:10px;right:10px;height:3px;
+              background:rgba(59,130,246,.12);border-radius:99px;overflow:hidden;}}
+  .bar-fill{{position:absolute;inset:0;height:100%;border-radius:99px;
+             background:#3b82f6;
+             transition:width .35s cubic-bezier(.4,0,.2,1);}}
   tfoot tr td{{background:#edf2f7;font-weight:600;border-top:2px solid #cbd5e0;
                color:#2d3748;padding:8px 11px;white-space:nowrap;}}
   .filter-bar{{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:14px 0 4px;}}
@@ -567,6 +587,63 @@ HTML_TEMPLATE = """\
   }});
   applyRowColors('sample');
   buildTableLegend('sample');
+
+  // ---------------------------------------------------------------------------
+  // DATA BARS: thin inset pill at the bottom of each numeric metric cell
+  // Largest visible value per column = 100% fill. Acquisition excluded.
+  // ---------------------------------------------------------------------------
+  const METRIC_COL_INDICES = (function() {{
+    const ths = Array.from(document.querySelectorAll('#cell-table thead th'));
+    return ths.map((th, i) => th.dataset.metric === 'true' ? i : -1).filter(i => i >= 0);
+  }})();
+
+  function ensureTrack(td) {{
+    let track = td.querySelector('.bar-track');
+    if (!track) {{
+      track = document.createElement('div');
+      track.className = 'bar-track';
+      const fill = document.createElement('div');
+      fill.className = 'bar-fill';
+      track.appendChild(fill);
+      td.appendChild(track);
+    }}
+    return track.querySelector('.bar-fill');
+  }}
+
+  function applyDataBars() {{
+    const rows = Array.from(
+      document.querySelectorAll('#cell-tbody tr')
+    ).filter(r => r.style.display !== 'none');
+
+    METRIC_COL_INDICES.forEach(ci => {{
+      let maxVal = 0;
+      rows.forEach(r => {{
+        const v = parseFloat(r.children[ci]?.dataset.value);
+        if (!isNaN(v) && v > maxVal) maxVal = v;
+      }});
+      rows.forEach(r => {{
+        const td = r.children[ci];
+        if (!td) return;
+        const fill = ensureTrack(td);
+        const v = parseFloat(td.dataset.value);
+        fill.style.width = (!isNaN(v) && maxVal > 0)
+          ? `${{Math.round((v / maxVal) * 100)}}%`
+          : '0%';
+      }});
+    }});
+  }}
+
+  // Patch sortTable to re-apply bars after each sort
+  (function() {{
+    const _orig = sortTable;
+    window.sortTable = function(th) {{ _orig(th); applyDataBars(); }};
+  }})();
+
+  // Re-apply bars when filters change
+  ['filter-run', 'filter-cell', 'filter-sample'].forEach(id =>
+    document.getElementById(id).addEventListener('change', applyDataBars));
+
+  applyDataBars();
 </script>
 
 <h3>Metric by Cell</h3>

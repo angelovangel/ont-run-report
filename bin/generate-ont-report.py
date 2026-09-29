@@ -304,11 +304,16 @@ HTML_TEMPLATE = """\
       cursor:pointer;user-select:none;white-space:nowrap;}}
   th:hover{{background:#e2e8f0;}}
   .sort-arrow{{font-size:10px;color:#4a5568;margin-left:3px;}}
-  td{{padding:9px 12px;border-bottom:1px solid #e9ecef;}}
+  td{{padding:8px 13px 14px;border-bottom:1px solid #e9ecef;position:relative;vertical-align:middle;}}
   tbody tr:last-child td{{border-bottom:none;}}
-  tbody tr:hover td{{background:#f0f4ff;}}
+  tbody tr:hover td{{background:rgba(59,130,246,.04);}}
+  .bar-track{{position:absolute;bottom:4px;left:10px;right:10px;height:3px;
+              background:rgba(59,130,246,.12);border-radius:99px;overflow:hidden;}}
+  .bar-fill{{position:absolute;inset:0;height:100%;border-radius:99px;
+             background:#3b82f6;
+             transition:width .35s cubic-bezier(.4,0,.2,1);}}
   tfoot tr td{{background:#edf2f7 !important;font-weight:600;border-top:2px solid #cbd5e0;
-               color:#2d3748;padding:9px 12px;white-space:nowrap;border-bottom:none;}}
+               color:#2d3748;padding:8px 13px;white-space:nowrap;border-bottom:none;}}
   .table-wrap{{overflow-x:auto;border-radius:6px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.07);}}
   .plot-container{{margin:20px 0;background:#fff;border-radius:8px;
                    box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e2e8f0;overflow:hidden;}}
@@ -327,15 +332,15 @@ HTML_TEMPLATE = """\
     <tr>
       <th data-type="text" onclick="sortTable(this)">Sample<span class="sort-arrow"></span></th>
       <th data-type="text" onclick="sortTable(this)">Flow Cell ID<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Yield (Gb)<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Total Reads<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Passed Reads<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Pass Rate (%)<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Avg Active Pores<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Yield / Pore (Mb)<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Blocking (%)<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Pores 24 h<span class="sort-arrow"></span></th>
-      <th style="text-align:right" data-type="number" onclick="sortTable(this)">Pores 48 h<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Yield (Gb)<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Total Reads<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Passed Reads<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Pass Rate (%)<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Avg Active Pores<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Yield / Pore (Mb)<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Blocking (%)<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Pores 24 h<span class="sort-arrow"></span></th>
+      <th style="text-align:right" data-type="number" data-metric="true" onclick="sortTable(this)">Pores 48 h<span class="sort-arrow"></span></th>
     </tr>
   </thead>
   <tbody id="summary-tbody">
@@ -372,7 +377,49 @@ HTML_TEMPLATE = """\
       return dir === 'asc' ? cmp : -cmp;
     }});
     rows.forEach(r => tbody.appendChild(r));
+    applyDataBars();
   }}
+
+  // DATA BARS: thin inset pill at the bottom of each numeric metric cell
+  const METRIC_COL_INDICES = (function() {{
+    const ths = Array.from(document.querySelectorAll('#summary-table thead th'));
+    return ths.map((th, i) => th.dataset.metric === 'true' ? i : -1).filter(i => i >= 0);
+  }})();
+
+  function ensureTrack(td) {{
+    let track = td.querySelector('.bar-track');
+    if (!track) {{
+      track = document.createElement('div');
+      track.className = 'bar-track';
+      const fill = document.createElement('div');
+      fill.className = 'bar-fill';
+      track.appendChild(fill);
+      td.appendChild(track);
+    }}
+    return track.querySelector('.bar-fill');
+  }}
+
+  function applyDataBars() {{
+    const rows = Array.from(document.querySelectorAll('#summary-tbody tr'));
+    METRIC_COL_INDICES.forEach(ci => {{
+      let maxVal = 0;
+      rows.forEach(r => {{
+        const v = parseFloat(r.children[ci]?.dataset.value);
+        if (!isNaN(v) && v > maxVal) maxVal = v;
+      }});
+      rows.forEach(r => {{
+        const td = r.children[ci];
+        if (!td) return;
+        const fill = ensureTrack(td);
+        const v = parseFloat(td.dataset.value);
+        fill.style.width = (!isNaN(v) && maxVal > 0)
+          ? `${{Math.round((v / maxVal) * 100)}}%`
+          : '0%';
+      }});
+    }});
+  }}
+
+  applyDataBars();
 </script>
 
 <h3>Active Pores Over Time (Pore Stability)</h3>
