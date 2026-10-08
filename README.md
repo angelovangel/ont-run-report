@@ -20,38 +20,15 @@ read-length Nx comparison:
 | :--- | :--- |
 | `pore_activity_*.csv` | Per-pore-state time series (number of pores in each state over the run). |
 | `throughput_*.csv` | Cumulative yield / read-count time series. |
-| `sequencing_summary.txt` / TSV | Optional local file for the Nx plot (`sequence_length_template` column); sampled in the browser. Only the 19 estimated Nx values are sent to the server. |
+| `sequencing_summary.txt` / TSV | Optional local file for the Nx plot (`sequence_length_template` column); sampled in the browser.
 
-Both files are found inside the run directory produced by MinKNOW, typically under `<experiment>/<run_id>/`. They are named `pore_activity_<run_id>.csv` and `throughput_<run_id>.csv`.
-
-#### ONT options
-
-| Option | Default | Description |
-| :--- | :--- | :--- |
-| **Number of flow cells** | 2 | How many flow cells to compare in the report (1–8). |
-| **Label** | Run N | Human-readable name for each flow cell. |
-| **Report title** | ONT Run Report | Title shown at the top of the HTML report. |
-| **Active-pores sampling (min)** | 5 | Down-sampling interval for the Active-Pores chart. |
-| **Sequencing summary** | None | Optional; select one MinKNOW `sequencing_summary.txt`/TSV per run to estimate N5–N95 read lengths (kb). The browser samples up to 10,000 reads across the file; the summary itself is not uploaded. |
-
-The browser reads a small prefix to estimate row spacing, then seeks to evenly
-spaced positions and calculates Nx from up to 10,000 sampled reads. It sends
-only the 19 estimated Nx points per run to the report generator. When invoking
-`bin/generate-ont-report.py` directly, use `--nx-values` to pass precomputed
-Nx points, or `--sequencing-summary` to let Python calculate Nx from files
-(large files are sampled up to 50,000 reads in this CLI mode).
+These files are found inside the run directory produced by MinKNOW, typically under `<experiment>/<run_id>/`. They are named `pore_activity_<run_id>.csv`, `throughput_<run_id>.csv` and `sequencing_summary_<run_id>.txt`.
 
 ---
 
 ### PacBio HiFi mode
 
 Upload one or more `*run-qc-export*.csv` files exported from **SMRT Link** (one file per run / instrument). Multiple files are merged into a single report.
-
-#### HiFi options
-
-| Option | Default | Description |
-| :--- | :--- | :--- |
-| **Report title** | HiFi Sequencing Report | Title shown at the top of the HTML report. |
 
 ---
 

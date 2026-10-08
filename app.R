@@ -33,7 +33,7 @@ if (length(stale_run_files)) {
 # Sidebar
 # ---------------------------------------------------------------------------
 sidebar <- sidebar(
-  title = 'Controls', width = 390, gap = '0.5rem',
+  title = NULL, width = 390, gap = '0.1rem',
   div(id = 'controls',
     # ---- Sequencer type toggle ----
     radioButtons('seq_type',
