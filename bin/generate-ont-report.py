@@ -15,6 +15,9 @@ Options
                                     If omitted, auto-discovered in CWD.
   --throughput   FILE [FILE ...]    One or more throughput_*.csv files.
                                     If omitted, auto-discovered in CWD.
+  --sequencing-summary FILE [...]  Optional ONT sequencing_summary.txt/TSV
+                                    files (one per sample, in matching order).
+  --nx-values JSON                 Precomputed Nx point arrays, one per sample.
   --labels       LABEL [LABEL ...]  Human-readable sample labels (must match
                                     the file order). Auto-derived if omitted.
   --title        TEXT               Report title (default: "ONT Sequencing Report").
@@ -39,6 +42,7 @@ import argparse
 import glob
 import json
 import csv
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -135,6 +139,82 @@ def parse_throughput(path):
         "total_bases": total_bases,
         "yield_gb": yield_gb,
     }
+
+
+READ_LENGTH_SAMPLE_MAX = 50_000
+READ_LENGTH_ESTIMATE_ROWS = 100
+
+
+def parse_sequencing_summary(path):
+    lengths = []
+    with open(path, "rb") as fh:
+        header_line = fh.readline().decode("utf-8-sig")
+        header = next(csv.reader([header_line], delimiter="\t"), [])
+        if "sequence_length_template" not in header:
+            raise ValueError(
+                f"{path}: missing required sequence_length_template column"
+            )
+        length_index = header.index("sequence_length_template")
+
+        body_start = fh.tell()
+        file_size = Path(path).stat().st_size
+        prefix_lines = []
+        for _ in range(READ_LENGTH_ESTIMATE_ROWS):
+            line = fh.readline()
+            if not line:
+                break
+            prefix_lines.append(line)
+
+        body_size = file_size - body_start
+        average_line_size = (
+            sum(map(len, prefix_lines)) / len(prefix_lines)
+            if prefix_lines else 1
+        )
+        estimated_read_count = body_size / average_line_size
+
+        def append_length(line, line_number):
+            row = next(csv.reader([line.decode("utf-8")], delimiter="\t"), [])
+            raw_length = row[length_index].strip() if length_index < len(row) else ""
+            try:
+                length = int(raw_length)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid sequence_length_template "
+                    f"value {raw_length!r}"
+                ) from exc
+            if length < 0:
+                raise ValueError(
+                    f"{path}:{line_number}: read length cannot be negative"
+                )
+            if length > 0:
+                lengths.append(length)
+
+        if estimated_read_count <= READ_LENGTH_SAMPLE_MAX:
+            for line_number, line in enumerate(prefix_lines, start=2):
+                append_length(line, line_number)
+            line_number = len(prefix_lines) + 2
+            for line in fh:
+                append_length(line, line_number)
+                line_number += 1
+        else:
+            sample_count = READ_LENGTH_SAMPLE_MAX
+            sample_spacing = body_size / sample_count
+            for sample_index in range(sample_count):
+                target = body_start + int(sample_index * sample_spacing)
+                fh.seek(target)
+                if target > body_start:
+                    fh.seek(target - 1)
+                    fh.readline()
+                line = fh.readline()
+                if line:
+                    estimated_line_number = (
+                        int((target - body_start) / average_line_size) + 2
+                    )
+                    append_length(line, estimated_line_number)
+
+    if not lengths:
+        raise ValueError(f"{path}: no positive read lengths found")
+    return lengths
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +323,74 @@ def build_cumulative_yield_data(samples, tp_data_list):
         ]
         series.append({"name": s["label"], "color": s["color"], "data": points})
     return {"title": "Cumulative Yield Over Time (Gb)", "samples": series}
+
+
+def calculate_nx(lengths):
+    ordered_lengths = sorted(lengths, reverse=True)
+    total_bases = sum(ordered_lengths)
+    if not ordered_lengths or total_bases <= 0:
+        raise ValueError("Cannot calculate Nx values without positive read lengths")
+
+    nx_values = {}
+    next_percentile_index = 0
+    percentiles = list(range(5, 100, 5))
+    cumulative_bases = 0
+    for length in ordered_lengths:
+        cumulative_bases += length
+        while next_percentile_index < len(percentiles):
+            percentile = percentiles[next_percentile_index]
+            if cumulative_bases * 100 < total_bases * percentile:
+                break
+            nx_values[percentile] = round(length / 1000, 3)
+            next_percentile_index += 1
+        if next_percentile_index == len(percentiles):
+            break
+
+    return [{"x": p, "y": nx_values[p]} for p in percentiles]
+
+
+def build_nx_plot_data(samples, sequencing_summary_files):
+    series = []
+    for sample, summary_path in zip(samples, sequencing_summary_files):
+        lengths = parse_sequencing_summary(summary_path)
+        series.append({
+            "name": sample["label"],
+            "color": sample["color"],
+            "data": calculate_nx(lengths),
+        })
+    return {"title": "Read Length Nx", "samples": series}
+
+
+def build_nx_plot_data_from_values(samples, nx_values):
+    percentiles = list(range(5, 100, 5))
+    if len(nx_values) != len(samples):
+        raise ValueError("Provide Nx values for every sample")
+
+    series = []
+    for sample, sample_values in zip(samples, nx_values):
+        if not isinstance(sample_values, list) or len(sample_values) != len(percentiles):
+            raise ValueError(
+                f"{sample['label']}: expected {len(percentiles)} Nx values"
+            )
+        points = []
+        for expected_percentile, point in zip(percentiles, sample_values):
+            if not isinstance(point, dict) or point.get("x") != expected_percentile:
+                raise ValueError(
+                    f"{sample['label']}: expected Nx percentile N{expected_percentile}"
+                )
+            value = point.get("y")
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError(
+                    f"{sample['label']}: invalid read length at N{expected_percentile}"
+                )
+            points.append({"x": expected_percentile, "y": round(value, 3)})
+        series.append({
+            "name": sample["label"],
+            "color": sample["color"],
+            "data": points,
+        })
+    return {"title": "Read Length Nx", "samples": series}
 
 
 def build_avg_pore_activity_data(samples):
@@ -421,6 +569,8 @@ HTML_TEMPLATE = """\
 
   applyDataBars();
 </script>
+
+{nx_section}
 
 <h3>Active Pores Over Time (Pore Stability)</h3>
 <div class="plot-container">
@@ -672,6 +822,140 @@ LINE_CHART_IFRAME = """\
     }}
 
     draw();
+  </script>
+</body>
+</html>"""
+
+
+NX_CHART_IFRAME = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{chart_title}</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         background:#fff;margin:0;padding:20px;color:#333;}}
+    #chart-container{{max-width:960px;margin:0 auto;position:relative;}}
+    .line{{fill:none;stroke-width:2.5px;opacity:0.85;}}
+    .tooltip{{position:absolute;padding:10px;font-size:13px;
+              background:rgba(255,255,255,.95);border:1px solid #ddd;border-radius:4px;
+              pointer-events:none;opacity:0;box-shadow:0 4px 6px rgba(0,0,0,.1);
+              white-space:nowrap;z-index:10;}}
+    .grid line{{stroke:#ddd;stroke-dasharray:4,4;}}
+    .grid path{{stroke-width:0;}}
+    .axis text{{font-size:12px;fill:#555;}}
+    .axis path,.axis line{{stroke:#bbb;}}
+    .hover-line{{stroke:#888;stroke-dasharray:4,4;stroke-width:1px;pointer-events:none;opacity:0;}}
+    h2{{text-align:center;color:#222;margin-bottom:6px;}}
+    .legend-item{{cursor:pointer;}}
+    .legend-text{{font-size:12px;fill:#333;user-select:none;}}
+  </style>
+</head>
+<body>
+  <div id="chart-container">
+    <h2>{chart_title}</h2>
+    <div id="chart"></div>
+    <div class="tooltip" id="tooltip"></div>
+  </div>
+  <script>
+    const plotData = {plot_data_json};
+    const percentiles = Array.from({{length:19}}, (_, i) => (i + 1) * 5);
+    const margin = {{top:20,right:180,bottom:50,left:70}};
+    const W = 960 - margin.left - margin.right;
+    const H = {chart_height} - margin.top - margin.bottom;
+    const svg = d3.select("#chart").append("svg")
+        .attr("width", W + margin.left + margin.right)
+        .attr("height", H + margin.top + margin.bottom)
+      .append("g")
+        .attr("transform", `translate(${{margin.left}},${{margin.top}})`);
+    const tooltip = d3.select("#tooltip");
+    const x = d3.scaleLinear().domain([5,95]).range([0,W]);
+    const yMax = d3.max(plotData.samples.flatMap(s => s.data), d => d.y) || 1;
+    const y = d3.scaleLinear().domain([0,yMax * 1.05]).nice().range([H,0]);
+    const xAxis = svg.append("g").attr("class","axis")
+        .attr("transform",`translate(0,${{H}})`)
+        .call(d3.axisBottom(x).tickValues(percentiles).tickFormat(d => "N" + d));
+    svg.append("g").attr("class","axis").call(
+        d3.axisLeft(y).tickFormat(d => d + " kb"));
+    svg.append("g").attr("class","grid")
+        .call(d3.axisLeft(y).tickSize(-W).tickFormat(""));
+    xAxis.selectAll("text").attr("transform","rotate(-35)")
+        .style("text-anchor","end").attr("dx","-0.4em").attr("dy","0.15em");
+    svg.append("text").attr("x",W/2).attr("y",H+48)
+        .attr("text-anchor","middle").attr("font-size","12px").attr("fill","#555")
+        .text("Nx percentile");
+    svg.append("text").attr("transform","rotate(-90)")
+        .attr("x",-H/2).attr("y",-55).attr("text-anchor","middle")
+        .attr("font-size","12px").attr("fill","#555").text("Read length (kb)");
+
+    const line = d3.line().x(d => x(d.x)).y(d => y(d.y)).curve(d3.curveMonotoneX);
+    plotData.samples.forEach((sample, i) => {{
+      const group = svg.append("g").attr("class",`sample-group sample-${{i}}`);
+      group.append("path").datum(sample.data).attr("class","line")
+          .attr("stroke",sample.color).attr("d",line);
+      group.selectAll("circle").data(sample.data).join("circle")
+          .attr("cx",d => x(d.x)).attr("cy",d => y(d.y)).attr("r",3)
+          .attr("fill",sample.color).attr("stroke","#fff").attr("stroke-width",1);
+    }});
+
+    const hoverLine = svg.append("line").attr("class","hover-line")
+        .attr("y1",0).attr("y2",H);
+    svg.append("rect").attr("width",W).attr("height",H).attr("fill","none")
+        .attr("pointer-events","all")
+        .on("mousemove", function(event) {{
+          const [mx] = d3.pointer(event);
+          const nearest = percentiles.reduce((best, p) =>
+            Math.abs(x(p) - mx) < Math.abs(x(best) - mx) ? p : best, percentiles[0]);
+          const isN50 = nearest === 50;
+          hoverLine.attr("x1",x(nearest)).attr("x2",x(nearest))
+              .style("stroke",isN50 ? "#dc2626" : "#888")
+              .style("stroke-width",isN50 ? "3px" : "1px")
+              .style("stroke-dasharray",isN50 ? "6,3" : "4,4")
+              .style("opacity",1);
+          let html = isN50
+            ? `<strong style="color:#dc2626;font-size:15px">N50</strong> <b>median read length</b><br/>`
+            : `<strong>N${{nearest}}</strong><br/>`;
+          plotData.samples.forEach(sample => {{
+            if (sample.hidden) return;
+            const point = sample.data.find(d => d.x === nearest);
+            if (point) html += `<span style="color:${{sample.color}}">&#9632;</span> ${{sample.name}}: <b>${{point.y.toFixed(3)}} kb</b><br/>`;
+          }});
+          tooltip.transition().duration(40).style("opacity",1);
+          tooltip.html(html).style("left",(event.pageX+15)+"px")
+              .style("border-color",isN50 ? "#dc2626" : "#ddd")
+              .style("box-shadow",isN50
+                ? "0 0 0 2px rgba(220,38,38,.18), 0 4px 6px rgba(0,0,0,.1)"
+                : "0 4px 6px rgba(0,0,0,.1)")
+              .style("top",Math.min(event.pageY-28,window.innerHeight-160)+"px");
+        }})
+        .on("mouseout", () => {{
+          hoverLine.style("opacity",0);
+          tooltip.transition().duration(200).style("opacity",0);
+        }});
+
+    const legend = svg.append("g").attr("transform",`translate(${{W+14}},0)`);
+    plotData.samples.forEach((sample, i) => {{
+      const row = legend.append("g").attr("class","legend-item")
+          .attr("transform",`translate(0,${{i*24}})`)
+          .on("mouseover",() => {{
+            svg.selectAll(".sample-group").style("opacity",0.15);
+            svg.select(`.sample-${{i}}`).style("opacity",1).raise();
+          }})
+          .on("mouseout",() => svg.selectAll(".sample-group").style("opacity",1))
+          .on("click",function() {{
+            sample.hidden = !sample.hidden;
+            svg.select(`.sample-${{i}}`).style("display",sample.hidden ? "none" : null);
+            d3.select(this).select("circle").style("fill",sample.hidden ? "#ccc" : sample.color);
+            d3.select(this).select("text")
+                .style("text-decoration",sample.hidden ? "line-through" : "none")
+                .style("fill",sample.hidden ? "#999" : "#333");
+          }});
+      row.append("circle").attr("r",5).style("fill",sample.color);
+      row.append("text").attr("class","legend-text").attr("x",10).attr("y",4)
+          .text(sample.name);
+    }});
   </script>
 </body>
 </html>"""
@@ -1032,6 +1316,15 @@ def _render_line_chart_iframe(plot_data, chart_height, y_label):
     return _html_escape_attr(html)
 
 
+def _render_nx_iframe(plot_data, chart_height):
+    html = NX_CHART_IFRAME.format(
+        chart_title=plot_data.get("title", ""),
+        plot_data_json=json.dumps(plot_data, separators=(",", ":")),
+        chart_height=chart_height,
+    )
+    return _html_escape_attr(html)
+
+
 def _render_active_pores_iframe(plot_data, chart_height):
     title = plot_data.get("title", "")
     json_str = json.dumps(plot_data, separators=(",", ":"))
@@ -1117,10 +1410,20 @@ def derive_label(pa_path):
 # MAIN GENERATION FUNCTION
 # ---------------------------------------------------------------------------
 
-def generate_report(pa_files, tp_files, labels, title, out_path, sample_hz):
+def generate_report(
+        pa_files, tp_files, labels, title, out_path, sample_hz,
+        sequencing_summary_files=None, nx_values=None):
     pairs = match_pairs(pa_files, tp_files)
     if not pairs:
         sys.exit("ERROR: No matching pore_activity/throughput file pairs found.")
+    if (sequencing_summary_files is not None
+            and len(sequencing_summary_files) != len(pairs)):
+        sys.exit(
+            "ERROR: Provide one sequencing summary file per matched sample, "
+            "in the same order."
+        )
+    if sequencing_summary_files is not None and nx_values is not None:
+        sys.exit("ERROR: Use either sequencing summary files or precomputed Nx values.")
 
     print(f"Found {len(pairs)} sample pair(s).")
 
@@ -1146,6 +1449,27 @@ def generate_report(pa_files, tp_files, labels, title, out_path, sample_hz):
     active_pores_data = build_active_pores_plot_data(samples_metrics, sample_hz)
     yield_data        = build_cumulative_yield_data(samples_metrics, tp_data_list)
     pore_act_data     = build_avg_pore_activity_data(samples_metrics)
+    nx_section = ""
+    if nx_values is not None:
+        try:
+            nx_data = build_nx_plot_data_from_values(samples_metrics, nx_values)
+        except ValueError as exc:
+            sys.exit(f"ERROR: Invalid precomputed Nx values: {exc}")
+    elif sequencing_summary_files is not None:
+        try:
+            nx_data = build_nx_plot_data(samples_metrics, sequencing_summary_files)
+        except (OSError, ValueError) as exc:
+            sys.exit(f"ERROR: Unable to read sequencing summary: {exc}")
+    if nx_values is not None or sequencing_summary_files is not None:
+        nx_iframe = _render_nx_iframe(nx_data, 440)
+        nx_section = (
+            "<h3>Read Length Nx</h3>\n"
+            "<div class=\"plot-container\">\n"
+            f"  <iframe srcdoc=\"{nx_iframe}\" width=\"100%\" height=\"520\" "
+            "frameborder=\"0\" scrolling=\"no\" "
+            "style=\"border:none;display:block;\"></iframe>\n"
+            "</div>\n"
+        )
 
     # Render iframes (escaped for HTML attributes)
     active_pores_iframe  = _render_active_pores_iframe(active_pores_data, 600)
@@ -1161,6 +1485,7 @@ def generate_report(pa_files, tp_files, labels, title, out_path, sample_hz):
         total_row=total_row,
         active_pores_iframe=active_pores_iframe,
         yield_iframe=yield_iframe,
+        nx_section=nx_section,
         pore_activity_iframe=pore_activity_iframe,
         generated_on=datetime.now().strftime("%Y-%m-%d %H:%M"),
     )
@@ -1183,6 +1508,10 @@ def main():
                         help="pore_activity_*.csv files (auto-discovered if omitted)")
     parser.add_argument("--throughput", nargs="+", metavar="FILE",
                         help="throughput_*.csv files (auto-discovered if omitted)")
+    parser.add_argument("--sequencing-summary", nargs="+", metavar="FILE",
+                        help="Optional sequencing_summary.txt/TSV files, one per sample")
+    parser.add_argument("--nx-values", metavar="JSON",
+                        help="Precomputed Nx data as JSON, one array of {x,y} points per sample")
     parser.add_argument("--labels", nargs="+", metavar="LABEL",
                         help="Human-readable sample labels (must match file order)")
     parser.add_argument("--title", default="ONT Sequencing Report",
@@ -1192,6 +1521,10 @@ def main():
     parser.add_argument("--sample-hz", type=int, default=5, metavar="INT",
                         help="Sampling interval for Active-Pores plot in minutes (default: 5)")
     args = parser.parse_args()
+    try:
+        nx_values = json.loads(args.nx_values) if args.nx_values else None
+    except json.JSONDecodeError as exc:
+        parser.error(f"--nx-values must be valid JSON: {exc}")
 
     pa_files = sorted(args.pore_activity or glob.glob("pore_activity_*.csv"))
     tp_files = sorted(args.throughput   or glob.glob("throughput_*.csv"))
@@ -1210,6 +1543,8 @@ def main():
         title=args.title,
         out_path=args.out,
         sample_hz=args.sample_hz,
+        sequencing_summary_files=args.sequencing_summary,
+        nx_values=nx_values,
     )
 
 

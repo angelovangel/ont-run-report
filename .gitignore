@@ -1,6 +1,4 @@
 .git
-.gitignore
-
 tmp/
 renv/library/
 .Rhistory
@@ -12,3 +10,4 @@ renv/library/
 .RData
 .DS_Store
 .DS_Store
+report.html
