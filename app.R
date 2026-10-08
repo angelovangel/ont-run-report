@@ -33,9 +33,8 @@ if (length(stale_run_files)) {
 # Sidebar
 # ---------------------------------------------------------------------------
 sidebar <- sidebar(
-  title = 'Controls', width = 400, gap = '0.5rem',
+  title = 'Controls', width = 390, gap = '0.5rem',
   div(id = 'controls',
-
     # ---- Sequencer type toggle ----
     radioButtons('seq_type',
       label = tags$span(
@@ -99,35 +98,29 @@ ui <- page_navbar(
   useShinyjs(),
   fillable = TRUE,
   title    = 'TGS Run Report',
-  theme    = bs_theme(bootswatch = 'yeti', primary = '#2E4053',
-                       font_scale = 1.0, spacer = '0.7rem'),
+  theme    = bs_theme(
+    version = 5,
+    bg = '#f4f6fb', fg = '#172238',
+    primary = '#465cf5', secondary = '#66738a',
+    success = '#129b78'
+  ),
   header   = tags$head(
-    tags$style(HTML("
-      .status-dot {
-        display: inline-block; width: 12px; height: 12px; border-radius: 50%;
-        margin-right: 6px; vertical-align: middle;
-      }
-      .status-red    { background-color: #e74c3c; }
-      .status-yellow { background-color: #f1c40f; }
-      .status-green  { background-color: #2ecc71; }
-      .tooltip-inner { max-width: 340px; }
-    ")),
+    tags$link(rel = 'stylesheet', type = 'text/css', href = 'app.css'),
     tags$script(src = "nx-summary.js")
   ),
   sidebar  = sidebar,
   nav_panel(
     use_busy_spinner(spin = "double-bounce", position = 'top-right', color = '#E67E22'),
     title = 'Generate Report',
-    div(class = "d-flex gap-2 mb-2",
-      shinyjs::disabled(
-        actionButton('start', 'Generate Report', class = 'btn-success flex-fill')
+    div(class = "workspace-shell",
+      div(class = "action-toolbar",
+        shinyjs::disabled(
+          actionButton('start', 'Generate Report', class = 'btn-success flex-fill')
+        ),
+        actionButton('reset', 'Reset', class = 'btn-outline-secondary flex-shrink-0')
       ),
-      actionButton('reset', 'Reset', class = 'flex-shrink-0')
-    ),
-    layout_column_wrap(
-      width = NULL, fill = TRUE, gap = '0.5rem',
-      style = htmltools::css(grid_template_columns = "1fr"),
       card(
+        class = 'console-card',
         full_screen = TRUE,
         card_header(
           class = 'py-1 d-flex align-items-center gap-1 small fw-semibold',
@@ -140,6 +133,7 @@ ui <- page_navbar(
       shinyjs::hidden(
         div(id = 'download_panel',
           card(
+            class = 'ready-card',
             card_header(class = 'py-1 small fw-semibold', 'Report ready'),
             card_body(class = 'p-2', uiOutput('report_link_ui'))
           )
