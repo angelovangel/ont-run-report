@@ -462,7 +462,7 @@ HTML_TEMPLATE = """\
              transition:width .35s cubic-bezier(.4,0,.2,1);}}
   tfoot tr td{{background:#edf2f7 !important;font-weight:600;border-top:2px solid #cbd5e0;
                color:#2d3748;padding:8px 13px;white-space:nowrap;border-bottom:none;}}
-  .table-wrap{{overflow-x:auto;border-radius:6px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.07);}}
+  .table-wrap{{overflow-x:auto;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.07);}}
   .plot-container{{margin:20px 0;background:#fff;border-radius:8px;
                    box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e2e8f0;overflow:hidden;}}
   .footer{{margin-top:48px;border-top:1px solid #e2e8f0;padding-top:14px;
