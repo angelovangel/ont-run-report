@@ -13,7 +13,7 @@ Usage
 Options
 -------
   --title   TEXT   Report title (default: "HiFi Sequencing Report").
-  --out     PATH   Output HTML file (default: report.html).
+  --out     PATH   Output HTML file (default: hifi-report.html).
 
 If no FILE arguments are given, the script auto-discovers files matching
 "*qc-export*.csv" in the current directory.
@@ -32,11 +32,13 @@ Examples
 import argparse
 import csv
 import glob
-import json
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from report_common import (D3_SOURCE_TAG, PAGE_TIP, TABLE_CSV_JS, fill, footer_html,
+                           load_d3, render_chart_iframe, tip_attr, tip_html)
 
 # ---------------------------------------------------------------------------
 # COLOUR PALETTE (one colour per unique Sample Name)
@@ -135,11 +137,39 @@ MASTER_METRICS = [
 ]
 
 # Table columns shown in the main summary table (subset of MASTER_METRICS,
-# by key, in display order). All metrics remain available in the plot
-# dropdowns regardless of this list.
+# by key, in display order). "read_lengths" and "loading" are combined mini
+# charts (see READ_LENGTH_MARKS / LOADING_PARTS). All metrics remain
+# available in the plot dropdowns regardless of this list.
 TABLE_METRIC_KEYS = [
-    "hifi_yield_gb", "q20_reads", "polymerase_rl_bp", "polymerase_n50_bp",
-    "mean_length_bp", "read_quality_q", "q30_bq_pct", "p1_pct",
+    "hifi_yield_gb", "q20_reads", "read_lengths", "read_quality_q", "q30_bq_pct", "loading",
+]
+
+# Shorter table headers for some metrics (CSV export keeps the full label).
+SHORT_LABELS = {"read_quality_q": "Median Q", "q30_bq_pct": "Q30+ BQ"}
+
+# Zero-based amounts that get a data bar in the table.
+BAR_METRIC_KEYS = {"hifi_yield_gb", "q20_reads"}
+
+# Read-length mini chart: (metric key, label, marker colour), on a kb axis
+# shared by all rows. Insert size is drawn as a ring and mean length as a dot
+# on top, since the two usually overlap.
+READ_LENGTH_MARKS = [
+    ("polymerase_rl_bp",  "Polymerase RL", "#64748b"),
+    ("polymerase_n50_bp", "Polymerase N50", "#1d4ed8"),
+    ("insert_size_bp",    "Insert size",   "#d97706"),
+    ("mean_length_bp",    "Mean length",   "#059669"),
+]
+RING_MARKS = {"insert_size_bp"}
+# Dashed guide lines through the read-length column, in kb.
+READ_LENGTH_GUIDES_KB = [10, 100, 200]
+# Read-length mini chart geometry (px); the guides are positioned from it.
+RL_CHART_W, RL_CHART_PAD, RL_CELL_PAD = 124, 5, 10
+
+# Loading mini chart: ZMW occupancy as a 100% stacked bar.
+LOADING_PARTS = [
+    ("p0_pct", "P0 (empty)",    "#cbd5e0"),
+    ("p1_pct", "P1 (single)",   "#22c55e"),
+    ("p2_pct", "P2 (multiple)", "#f59e0b"),
 ]
 
 
@@ -248,22 +278,43 @@ def assign_colors(cells):
 METRICS_BY_KEY = {key: (label, dec) for key, _col, label, _fn, dec, _t in MASTER_METRICS}
 
 # Unified column model: identity columns (text, some filterable via a
-# dropdown), metric columns (numeric, pulled from rec["metrics"]), and the
-# derived "Acquisition" column (Use + Is Multi-Use Cell combined).
+# dropdown), metric columns (numeric, pulled from rec["metrics"]), the derived
+# "Acquisition" column (Use + Is Multi-Use Cell combined) and the two mini
+# chart columns.
 COLUMNS = [
     {"key": "run_name",    "label": "Run Name", "type": "text", "filter": True},
     {"key": "cell_id",     "label": "Cell ID",   "type": "text", "filter": True},
-    {"key": "acquisition", "label": "Acquisition", "type": "number",
-     "dec": 0, "metric": False, "filter": False},
+    {"key": "acquisition", "label": "Use", "type": "number", "csv_cols": "Acquisition",
+     "dec": 0, "filter": False, "title": "Acquisition number: how many times this SMRT cell has been used"},
     {"key": "sample_name", "label": "Sample",    "type": "text", "filter": True},
     {"key": "well",        "label": "Well",      "type": "text", "filter": False},
 ]
 for _mkey in TABLE_METRIC_KEYS:
-    _label, _dec = METRICS_BY_KEY[_mkey]
-    COLUMNS.append({"key": _mkey, "label": _label, "type": "number",
-                     "dec": _dec, "metric": True, "filter": False})
+    if _mkey == "read_lengths":
+        COLUMNS.append({
+            "key": _mkey, "label": "Read Lengths (kb)", "type": "number", "filter": False,
+            "csv_cols": "|".join(METRICS_BY_KEY[k][0] for k, _l, _c in READ_LENGTH_MARKS),
+            "title": "Markers on a kb axis shared by all rows: "
+                     + ", ".join(label for _k, label, _c in READ_LENGTH_MARKS)
+                     + ". Dashed lines at " + ", ".join(f"{kb}" for kb in READ_LENGTH_GUIDES_KB)
+                     + " kb. Sorts by polymerase N50."})
+    elif _mkey == "loading":
+        COLUMNS.append({
+            "key": _mkey, "label": "Loading", "type": "number", "filter": False,
+            "csv_cols": "|".join(METRICS_BY_KEY[k][0] for k, _l, _c in LOADING_PARTS),
+            "title": "Share of ZMWs that are empty (P0), hold one polymerase (P1) "
+                     "or several (P2). Sorts by P1."})
+    else:
+        _label, _dec = METRICS_BY_KEY[_mkey]
+        _col = {"key": _mkey, "label": SHORT_LABELS.get(_mkey, _label), "type": "number",
+                "dec": _dec, "bar": _mkey in BAR_METRIC_KEYS, "filter": False}
+        if _mkey in SHORT_LABELS:
+            _col["csv_cols"] = _label
+        COLUMNS.append(_col)
 
 FILTER_COLUMNS = [c for c in COLUMNS if c["filter"]]
+# Columns summed in the run subtotal and Total rows.
+SUM_KEYS = ["hifi_yield_gb", "q20_reads"]
 
 
 def _fmt_number(dec, value):
@@ -283,6 +334,10 @@ def _col_value(rec, col):
         return rec[key]
     if key == "acquisition":
         return rec["acquisition_no"]
+    if key == "read_lengths":
+        return rec["metrics"].get("polymerase_n50_bp")
+    if key == "loading":
+        return rec["metrics"].get("p1_pct")
     return rec["metrics"].get(key)
 
 
@@ -294,7 +349,9 @@ def _col_display(rec, col):
         if val is None:
             return "-"
         return f"{val:,.0f} (multi-use)" if rec["multi_use"] else f"{val:,.0f}"
-    return _fmt_number(col["dec"], val)
+    text = _fmt_number(col["dec"], val)
+    # Percent metrics whose short header dropped the "(%)" carry the sign instead.
+    return text + "%" if col["key"] in SHORT_LABELS and col["key"].endswith("_pct") and val is not None else text
 
 
 DOT = '<span style="display:inline-block;width:11px;height:11px;border-radius:50%;background:#9ca3af;margin:0 2px;vertical-align:middle;"></span>'
@@ -307,21 +364,113 @@ def _acq_dots(val):
     return DOT * n
 
 
+def _rl_px(bp, max_bp):
+    """x of a length (bp) in the read-length chart; axis shared by all rows."""
+    return RL_CHART_PAD + (RL_CHART_W - 2 * RL_CHART_PAD) * bp / max(max_bp, 1)
+
+
+def read_length_guide_css(max_bp):
+    """CSS drawing the kb guides as dashed lines filling each cell row.
+
+    They are a background of the column's cells in the sample rows, so each
+    line spans the full row height. The chart is right-aligned in the cell,
+    so each line is placed from the cell's right edge.
+    """
+    offsets = [RL_CELL_PAD + RL_CHART_W - _rl_px(kb * 1000, max_bp) - 0.5
+               for kb in READ_LENGTH_GUIDES_KB if kb * 1000 <= max_bp]
+    if not offsets:
+        return ""
+    dash = "linear-gradient(#a0aec0 50%, transparent 50%)"
+    return ("#cell-table tr.cell-row td.rl-col{"
+            f"background-image:{', '.join([dash] * len(offsets))};"
+            f"background-size:1px 4px;background-repeat:repeat-y;"
+            f"background-position:{', '.join(f'right {o:.1f}px top 0' for o in offsets)};}}")
+
+
+def _max_read_bp(cells):
+    return max((rec["metrics"].get(k) or 0 for rec in cells
+                for k, _l, _c in READ_LENGTH_MARKS), default=1)
+
+
+def _read_length_chart(rec, max_bp, h=22):
+    """Read-length markers on a kb axis shared by all rows (inline SVG)."""
+    w, pad = RL_CHART_W, RL_CHART_PAD
+    def px(bp): return _rl_px(bp, max_bp)
+    marks = []
+    for key, label, color in READ_LENGTH_MARKS:
+        v = rec["metrics"].get(key)
+        if v is None:
+            continue
+        if key in RING_MARKS:
+            marks.append(f'<circle cx="{px(v):.1f}" cy="{h / 2}" r="5.5" fill="#fff" '
+                         f'stroke="{color}" stroke-width="2"/>')
+        else:
+            marks.append(f'<circle cx="{px(v):.1f}" cy="{h / 2}" r="3.5" fill="{color}" '
+                         f'stroke="#fff" stroke-width="1"/>')
+    return (f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" '
+            f'aria-label="Read lengths">'
+            f'<line x1="{pad}" x2="{w - pad}" y1="{h / 2}" y2="{h / 2}" stroke="#e2e8f0" '
+            f'stroke-width="2"/>{"".join(marks)}</svg>')
+
+
+def _loading_bar(rec, w=64, h=12):
+    """P0/P1/P2 as a 100% stacked bar, with P1 printed next to it."""
+    parts = [(label, rec["metrics"].get(key), color) for key, label, color in LOADING_PARTS]
+    if all(v is None for _l, v, _c in parts):
+        return "-"
+    total = sum(v or 0 for _l, v, _c in parts) or 1
+    x, rects = 0.0, []
+    for _label, v, color in parts:
+        width = w * (v or 0) / total
+        rects.append(f'<rect x="{x:.2f}" y="0" width="{width:.2f}" height="{h}" fill="{color}"/>')
+        x += width
+    label_text = ", ".join(f"{label.split()[0]} {v:.1f}%" for label, v, _c in parts if v is not None)
+    p1 = rec["metrics"].get("p1_pct")
+    p1_text = "" if p1 is None else f'<span class="load-p1">{p1:.1f}%</span>'
+    return (f'<span class="load"><svg width="{w}" height="{h}" '
+            f'viewBox="0 0 {w} {h}" role="img" aria-label="Loading {label_text}">'
+            f'{"".join(rects)}</svg>{p1_text}</span>')
+
+
+def _read_length_tip(rec):
+    # Ring markers get an outlined swatch, like in the chart.
+    rows = [(f"ring:{c}" if k in RING_MARKS else c, label, f"{rec['metrics'][k] / 1000:,.1f} kb")
+            for k, label, c in READ_LENGTH_MARKS if rec["metrics"].get(k) is not None]
+    return tip_html(f"{_html_escape(rec['label'])}: read lengths", rows)
+
+
+def _loading_tip(rec):
+    rows = [(c, label, f"{rec['metrics'][k]:.1f}%")
+            for k, label, c in LOADING_PARTS if rec["metrics"].get(k) is not None]
+    return tip_html(f"{_html_escape(rec['label'])}: loading", rows,
+                    "Share of ZMWs that are empty, hold one polymerase, or several")
+
+
+def _csv_values(rec, keys):
+    vals = [rec["metrics"].get(k) for k in keys]
+    return "|".join("" if v is None else repr(v) for v in vals)
+
+
 def render_table_header():
     ths = []
     for col in COLUMNS:
-        align = ' style="text-align:right"' if col["type"] == "number" else ""
-        is_metric = " data-metric=\"true\"" if col.get("metric") else ""
-        ths.append(f'<th{align} data-type="{col["type"]}"{is_metric} onclick="sortTable(this)">'
-                   f'{col["label"]}<span class="sort-arrow"></span></th>')
+        attrs = [f'data-type="{col["type"]}"', 'onclick="sortTable(this)"']
+        if col["type"] == "number":
+            attrs.append('style="text-align:right"')
+        if col.get("bar"):
+            attrs.append('data-bar="true"')
+        if col.get("csv_cols"):
+            attrs.append(f'data-csv-cols="{_html_escape(col["csv_cols"])}"')
+        if col.get("title"):
+            attrs.append(tip_attr(tip_html(_html_escape(col["label"]), text=_html_escape(col["title"]))))
+        ths.append(f'<th {" ".join(attrs)}>{col["label"]}<span class="sort-arrow"></span></th>')
     return "".join(ths)
 
 
-def render_table_row(rec):
+def render_table_row(rec, max_read_bp):
     tds = []
     for i, col in enumerate(COLUMNS):
         val = _col_value(rec, col)
-        disp = _col_display(rec, col)
         if col["type"] == "number":
             data_value = "" if val is None else repr(val)
         else:
@@ -329,22 +478,39 @@ def render_table_row(rec):
 
         style_parts = []
         class_parts = []
+        extra = ""
         if col["type"] == "number":
             style_parts.append("text-align:right")
         if i == 0:
             class_parts.append("color-stripe")
-            style_parts.append(f"border-left:4px solid {rec['colors']['sample']}")
-        style_attr = f' style="{";".join(style_parts)}"' if style_parts else ""
-        class_attr = f' class="{" ".join(class_parts)}"' if class_parts else ""
+            # An inset shadow, not a border, so the stripe moves with the sticky cell.
+            style_parts.append(f"box-shadow:inset 4px 0 0 {rec['colors']['sample']},inset -1px 0 0 #e2e8f0")
 
         if col["key"] == "acquisition":
             cell_content = _acq_dots(val)
+            if val is not None:
+                extra = " " + tip_attr(tip_html(f"Use {val}", text=(
+                    f"Acquisition {val} of SMRT cell {_html_escape(rec['cell_id'])}"
+                    + (" (multi-use cell)" if rec["multi_use"] else ""))))
+        elif col["key"] == "read_lengths":
+            cell_content = _read_length_chart(rec, max_read_bp)
+            class_parts += ["mini", "rl-col"]
+            extra = (f' data-csv="{_csv_values(rec, [k for k, _l, _c in READ_LENGTH_MARKS])}" '
+                     + tip_attr(_read_length_tip(rec)))
+        elif col["key"] == "loading":
+            cell_content = _loading_bar(rec)
+            class_parts.append("mini")
+            extra = (f' data-csv="{_csv_values(rec, [k for k, _l, _c in LOADING_PARTS])}" '
+                     + tip_attr(_loading_tip(rec)))
         else:
-            cell_content = _html_escape(disp)
-        tds.append(f'<td{class_attr}{style_attr} data-value="{_html_escape(data_value)}">'
+            cell_content = _html_escape(_col_display(rec, col))
+        style_attr = f' style="{";".join(style_parts)}"' if style_parts else ""
+        class_attr = f' class="{" ".join(class_parts)}"' if class_parts else ""
+        tds.append(f'<td{class_attr}{style_attr} data-value="{_html_escape(data_value)}"{extra}>'
                    f'{cell_content}</td>')
 
-    row_attrs = (f'data-run="{_html_escape(rec["run_name"])}" '
+    row_attrs = (f'class="cell-row" '
+                f'data-run="{_html_escape(rec["run_name"])}" '
                 f'data-cell="{_html_escape(rec["cell_id"])}" '
                 f'data-sample="{_html_escape(rec["sample_name"])}" '
                 f'data-color-sample="{rec["colors"]["sample"]}" '
@@ -353,33 +519,57 @@ def render_table_row(rec):
     return f"    <tr {row_attrs}>" + "".join(tds) + "</tr>"
 
 
+def _sum_row(cls, label, csv_label):
+    """Row with label + summed columns; values are filled in by the page JS."""
+    tds = []
+    for i, col in enumerate(COLUMNS):
+        if i == 0:
+            tds.append(f'<td class="sum-label" data-csv="{csv_label}">{label}</td>')
+        elif col["key"] in SUM_KEYS:
+            tds.append(f'<td style="text-align:right" data-sum="{col["key"]}" data-value=""></td>')
+        else:
+            tds.append("<td></td>")
+    return f'    <tr class="{cls}">' + "".join(tds) + "</tr>"
+
+
+def render_table_body(cells):
+    """One <tbody> per run (cells in run order) ending in a subtotal row."""
+    max_read_bp = _max_read_bp(cells)
+    runs = {}
+    for rec in cells:
+        runs.setdefault(rec["run_name"] or "Unknown", []).append(rec)
+    bodies = []
+    for run, recs in runs.items():
+        rows = "\n".join(render_table_row(rec, max_read_bp) for rec in recs)
+        bodies.append(f'  <tbody class="run-group" data-run="{_html_escape(run)}">\n{rows}\n'
+                      + _sum_row("subtotal", "Subtotal", "Subtotal") + "\n  </tbody>")
+    return "\n".join(bodies)
+
+
 def render_filter_options(cells, key):
     values = sorted({rec[key] for rec in cells if rec[key]})
     return "".join(f'<option value="{_html_escape(v)}">{_html_escape(v)}</option>'
                    for v in values)
 
 
-def render_table_footer(cells):
-    """Build a <tfoot> total row summing HiFi Yield and HiFi Reads."""
-    n_text_cols = sum(1 for c in COLUMNS if c["type"] == "text" or c["key"] == "acquisition")
-    total_yield = sum(
-        (c["metrics"].get("hifi_yield_gb") or 0) for c in cells
-    )
-    total_reads = sum(
-        int(c["metrics"].get("q20_reads") or 0) for c in cells
-    )
-    tds = []
-    for i, col in enumerate(COLUMNS):
-        style = ' style="text-align:right"' if col["type"] == "number" else ""
-        if i == 0:
-            tds.append(f"<td><strong>Total</strong></td>")
-        elif col["key"] == "hifi_yield_gb":
-            tds.append(f"<td style='text-align:right'>{total_yield:,.2f}</td>")
-        elif col["key"] == "q20_reads":
-            tds.append(f"<td style='text-align:right'>{total_reads:,}</td>")
-        else:
-            tds.append(f"<td{style}></td>")
-    return f"    <tr>" + "".join(tds) + "</tr>"
+def render_table_footer():
+    return _sum_row("total-row", "<strong>Total</strong>", "Total")
+
+
+def render_table_legend():
+    """Key for the two mini chart columns, shown under the table."""
+    def swatch(color, shape):
+        radius = "2px" if shape == "box" else "50%"
+        fill = (f"background:#fff;border:2px solid {color};width:7px;height:7px;"
+                if shape == "ring" else f"background:{color};width:9px;height:9px;")
+        return (f'<span style="display:inline-block;{fill}border-radius:{radius};'
+                f'margin:0 4px 0 10px;vertical-align:middle;"></span>')
+    lengths = "".join(swatch(c, "ring" if k in RING_MARKS else "dot") + label
+                      for k, label, c in READ_LENGTH_MARKS)
+    loading = "".join(swatch(c, "box") + label for _k, label, c in LOADING_PARTS)
+    guides = ", ".join(str(kb) for kb in READ_LENGTH_GUIDES_KB)
+    return (f"<b>Read lengths:</b>{lengths} &nbsp;(dashed lines: {guides} kb) "
+            f"&nbsp;&nbsp; <b>Loading:</b>{loading}")
 
 
 # ---------------------------------------------------------------------------
@@ -431,58 +621,98 @@ HTML_TEMPLATE = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title}</title>
+<title>%%TITLE%%</title>
 <meta name="description" content="Interactive PacBio HiFi run QC report.">
+%%D3_SOURCE%%
 <style>
-  *,*::before,*::after{{box-sizing:border-box;}}
-  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-        max-width:1100px;margin:0 auto;padding:24px 28px;color:#2d3748;
-        line-height:1.55;background:#f7f8fa;}}
-  h2{{color:#1a202c;border-bottom:2px solid #e2e8f0;padding-bottom:8px;margin-top:40px;}}
-  h3{{color:#2d3748;margin-top:28px;font-size:1.05rem;}}
-  .subtitle{{color:#718096;font-size:13.5px;margin-top:-8px;}}
-  .table-wrap{{overflow-x:auto;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.07);}}
-  table{{border-collapse:collapse;width:100%;margin:14px 0;font-size:13px;
-         background:#fff;white-space:nowrap;}}
-  th{{background:#edf2f7;color:#2d3748;font-weight:600;text-align:left;
-      padding:9px 11px;border-bottom:2px solid #cbd5e0;position:sticky;top:0;
-      cursor:pointer;user-select:none;}}
-  th:hover{{background:#e2e8f0;}}
-  .sort-arrow{{font-size:10px;color:#4a5568;margin-left:3px;}}
-  td{{padding:8px 13px 14px;border-bottom:1px solid #e9ecef;position:relative;vertical-align:middle;}}
-  tr:last-child td{{border-bottom:none;}}
-  tr:hover td{{background:rgba(59,130,246,.04);}}
-  .bar-track{{position:absolute;bottom:4px;left:10px;right:10px;height:3px;
-              background:rgba(59,130,246,.12);border-radius:99px;overflow:hidden;}}
-  .bar-fill{{position:absolute;inset:0;height:100%;border-radius:99px;
+  *,*::before,*::after{box-sizing:border-box;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+        max-width:1160px;margin:0 auto;padding:24px 28px;color:#2d3748;
+        line-height:1.55;background:#f7f8fa;}
+  h2{color:#1a202c;border-bottom:2px solid #e2e8f0;padding-bottom:8px;margin-top:40px;}
+  h3{color:#2d3748;margin-top:28px;font-size:1.05rem;}
+  .subtitle{color:#718096;font-size:13.5px;margin-top:-8px;}
+  .table-wrap{overflow-x:auto;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.07);}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13px;
+         background:#fff;white-space:nowrap;}
+  th{background:#edf2f7;color:#2d3748;font-weight:600;text-align:left;
+      padding:9px 10px;border-bottom:2px solid #cbd5e0;position:sticky;top:0;
+      cursor:pointer;user-select:none;}
+  th:hover{background:#e2e8f0;}
+  .sort-arrow{font-size:10px;color:#4a5568;margin-left:3px;}
+  td{padding:8px 10px 14px;border-bottom:1px solid #e9ecef;position:relative;vertical-align:middle;}
+  td.color-stripe{padding-left:14px;}
+  tr:last-child td{border-bottom:none;}
+  td.mini{padding:6px 10px;line-height:0;}
+%%READ_LENGTH_GUIDE_CSS%%
+  td.mini svg{vertical-align:middle;}
+  .load{display:inline-flex;align-items:center;gap:6px;line-height:1;}
+  .load svg{border-radius:3px;}
+  .load-p1{font-size:12px;color:#4a5568;min-width:42px;text-align:right;}
+  /* Run groups: subtotal row closes each run's <tbody> */
+  tbody.run-group + tbody.run-group tr:first-child td{border-top:2px solid #e2e8f0;}
+  tr.subtotal td{background-color:#f8fafc;font-weight:600;color:#4a5568;font-size:12.5px;
+                 padding:6px 13px;border-bottom:none;}
+  .sum-label .sub{font-weight:400;color:#718096;margin-left:4px;}
+  /* Run Name column stays visible while the table scrolls sideways */
+  #cell-table th:first-child,#cell-table td:first-child{position:sticky;left:0;z-index:2;
+     box-shadow:inset -1px 0 0 #e2e8f0;}
+  #cell-table tbody td:first-child{background:#fff;}
+  #cell-table tr.subtotal td:first-child{background:#f8fafc;}
+  .table-note{font-size:12px;color:#718096;margin:6px 0 8px;}
+  tr:hover td{background-color:rgba(59,130,246,.04);}
+  .bar-track{position:absolute;bottom:4px;left:10px;right:10px;height:3px;
+              background:rgba(59,130,246,.12);border-radius:99px;overflow:hidden;}
+  .bar-fill{position:absolute;inset:0;height:100%;border-radius:99px;
              background:#3b82f6;
-             transition:width .35s cubic-bezier(.4,0,.2,1);}}
-  tfoot tr td{{background:#edf2f7;font-weight:600;border-top:2px solid #cbd5e0;
-               color:#2d3748;padding:8px 11px;white-space:nowrap;}}
-  .filter-bar{{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:14px 0 4px;}}
-  .filter-bar label{{font-size:12.5px;font-weight:600;color:#555;}}
-  .filter-bar select{{padding:5px 10px;font-size:12.5px;border:1px solid #cbd5e0;
-                      border-radius:6px;background:#f8fafc;color:#2d3748;cursor:pointer;}}
-  .row-count{{font-size:12.5px;color:#718096;margin-left:auto;}}
-  .plot-container{{margin:20px 0;background:#fff;border-radius:8px;
-                   box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e2e8f0;overflow:hidden;}}
-  .footer{{margin-top:48px;border-top:1px solid #e2e8f0;padding-top:14px;
-           color:#a0aec0;font-size:12px;text-align:center;}}
+             transition:width .35s cubic-bezier(.4,0,.2,1);}
+  tfoot tr td{background:#edf2f7;font-weight:600;border-top:2px solid #cbd5e0;
+               color:#2d3748;padding:8px 11px;white-space:nowrap;}
+  .filter-bar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:14px 0 4px;}
+  .filter-bar label{font-size:12.5px;font-weight:600;color:#555;}
+  .filter-bar select{padding:5px 10px;font-size:12.5px;border:1px solid #cbd5e0;
+                      border-radius:6px;background:#f8fafc;color:#2d3748;cursor:pointer;}
+  .row-count{font-size:12.5px;color:#718096;margin-left:auto;}
+  .plot-container{margin:20px 0;background:#fff;border-radius:8px;
+                   box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e2e8f0;overflow:hidden;}
+  .plot-container iframe{border:none;display:block;width:100%;}
+  .section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;
+                flex-wrap:wrap;margin-top:28px;}
+  .section-head h3{margin:0;}
+  .btn{font:inherit;font-size:12px;padding:4px 12px;border:1px solid #cbd5e0;border-radius:6px;
+       background:#fff;color:#2d3748;cursor:pointer;}
+  .btn:hover{background:#edf2f7;}
+  .footer{margin-top:48px;border-top:1px solid #e2e8f0;padding-top:14px;
+           color:#a0aec0;font-size:12px;text-align:center;}
+  @media (max-width:640px){
+    body{padding:16px;}
+    h2{margin-top:16px;font-size:1.3rem;}
+    .filter-bar{gap:8px 12px;}
+    .row-count{margin-left:0;width:100%;}
+  }
 </style>
 </head>
 <body>
 
-<h2>{title}</h2>
-<p class="subtitle">{n_cells} SMRT cell(s) across {n_runs} run(s) &mdash; generated on {generated_on}</p>
+<h2>%%TITLE%%</h2>
+<p class="subtitle">%%N_CELLS%% SMRT cell(s) across %%N_RUNS%% run(s) &mdash; generated on %%GENERATED_ON%%</p>
 
-<h3>Cell Summary</h3>
+<h3>Sample Summary</h3>
+<div class="plot-container">
+  <iframe srcdoc="%%SAMPLE_IFRAME%%" height="%%SAMPLE_IFRAME_H%%" frameborder="0" scrolling="no"></iframe>
+</div>
+
+<div class="section-head">
+  <h3>Cell Summary</h3>
+  <button class="btn" onclick="downloadTableCsv('cell-table', 'cells')" data-tip="<div class='tt-text'>Rows hidden by the filters are left out.</div>">Download CSV</button>
+</div>
 <div class="filter-bar">
   <label for="filter-run">Run Name</label>
-  <select id="filter-run"><option value="">All</option>{filter_run_options}</select>
+  <select id="filter-run"><option value="">All</option>%%FILTER_RUN_OPTIONS%%</select>
   <label for="filter-cell">Cell ID</label>
-  <select id="filter-cell"><option value="">All</option>{filter_cell_options}</select>
+  <select id="filter-cell"><option value="">All</option>%%FILTER_CELL_OPTIONS%%</select>
   <label for="filter-sample">Sample</label>
-  <select id="filter-sample"><option value="">All</option>{filter_sample_options}</select>
+  <select id="filter-sample"><option value="">All</option>%%FILTER_SAMPLE_OPTIONS%%</select>
   <label for="color-by-select">Color by</label>
   <select id="color-by-select">
     <option value="sample">Sample</option>
@@ -494,210 +724,277 @@ HTML_TEMPLATE = """\
 <div id="table-legend" style="display:flex;flex-wrap:wrap;gap:12px;margin:2px 0 12px;font-size:12px;color:#555;"></div>
 <div class="table-wrap">
 <table id="cell-table">
-  <thead><tr>{table_header}</tr></thead>
-  <tbody id="cell-tbody">
-{table_rows}
-  </tbody>
+  <thead><tr>%%TABLE_HEADER%%</tr></thead>
+%%TABLE_BODIES%%
   <tfoot>
-{table_footer}
+%%TABLE_FOOTER%%
   </tfoot>
 </table>
 </div>
+<p class="table-note">%%TABLE_LEGEND%%</p>
 <script>
-  function sortTable(th) {{
-    const table = th.closest('table');
-    const tbody = table.querySelector('tbody');
-    const headerCells = Array.from(th.parentNode.children);
-    const colIndex = headerCells.indexOf(th);
+%%TABLE_CSV_JS%%
+
+  const CELL_ROWS = 'tr.cell-row';
+  const visibleCellRows = scope => Array.from(scope.querySelectorAll(CELL_ROWS))
+    .filter(r => r.style.display !== 'none');
+  const HEADER_THS = Array.from(document.querySelectorAll('#cell-table thead th'));
+
+  // Sorting keeps the run groups: rows are sorted within each run's <tbody>,
+  // and its subtotal row stays last.
+  function sortTable(th) {
+    const colIndex = HEADER_THS.indexOf(th);
     const type = th.dataset.type;
     const dir = th.dataset.dir === 'asc' ? 'desc' : 'asc';
-    headerCells.forEach(h => {{ h.dataset.dir = ''; h.querySelector('.sort-arrow').textContent = ''; }});
+    HEADER_THS.forEach(h => { h.dataset.dir = ''; h.querySelector('.sort-arrow').textContent = ''; });
     th.dataset.dir = dir;
     th.querySelector('.sort-arrow').textContent = dir === 'asc' ? '\u25B2' : '\u25BC';
 
-    const rows = Array.from(tbody.querySelectorAll('tr'));
-    rows.sort((a, b) => {{
-      const av = a.children[colIndex].dataset.value;
-      const bv = b.children[colIndex].dataset.value;
-      let cmp;
-      if (type === 'number') {{
-        const an = av === '' ? -Infinity : parseFloat(av);
-        const bn = bv === '' ? -Infinity : parseFloat(bv);
-        cmp = an - bn;
-      }} else {{
-        cmp = av.localeCompare(bv);
-      }}
-      return dir === 'asc' ? cmp : -cmp;
-    }});
-    rows.forEach(r => tbody.appendChild(r));
-  }}
+    document.querySelectorAll('#cell-table tbody.run-group').forEach(tbody => {
+      const rows = Array.from(tbody.querySelectorAll(CELL_ROWS));
+      rows.sort((a, b) => {
+        const av = a.children[colIndex].dataset.value;
+        const bv = b.children[colIndex].dataset.value;
+        let cmp;
+        if (type === 'number') {
+          const an = av === '' ? -Infinity : parseFloat(av);
+          const bn = bv === '' ? -Infinity : parseFloat(bv);
+          cmp = an - bn;
+        } else {
+          cmp = av.localeCompare(bv);
+        }
+        return dir === 'asc' ? cmp : -cmp;
+      });
+      const subtotal = tbody.querySelector('tr.subtotal');
+      rows.forEach(r => tbody.insertBefore(r, subtotal));
+    });
+    applyDataBars();
+  }
 
-  function applyFilters() {{
+  // Fill a subtotal/total row from the visible cell rows in `scope`.
+  function fillSums(row, rows) {
+    row.querySelectorAll('td[data-sum]').forEach(td => {
+      const ci = Array.from(row.children).indexOf(td);
+      const sum = rows.reduce((acc, r) => acc + (parseFloat(r.children[ci].dataset.value) || 0), 0);
+      const isYield = td.dataset.sum === 'hifi_yield_gb';
+      td.dataset.value = isYield ? sum.toFixed(2) : String(Math.round(sum));
+      td.textContent = sum.toLocaleString(undefined, isYield
+        ? {minimumFractionDigits: 2, maximumFractionDigits: 2} : {maximumFractionDigits: 0});
+    });
+  }
+
+  function updateSums() {
+    document.querySelectorAll('#cell-table tbody.run-group').forEach(tbody => {
+      const rows = visibleCellRows(tbody);
+      const subtotal = tbody.querySelector('tr.subtotal');
+      // A subtotal of one cell repeats that cell, so only show it for two or more.
+      subtotal.style.display = rows.length > 1 ? '' : 'none';
+      subtotal.querySelector('.sum-label').innerHTML =
+        `Subtotal <span class="sub">${rows.length} cells</span>`;
+      fillSums(subtotal, rows);
+    });
+    const all = visibleCellRows(document.getElementById('cell-table'));
+    const total = document.querySelector('#cell-table tr.total-row');
+    fillSums(total, all);
+    total.querySelector('.sum-label').innerHTML =
+      `<strong>Total</strong> <span class="sub">${all.length} cell${all.length === 1 ? '' : 's'}</span>`;
+  }
+
+  function applyFilters() {
     const run = document.getElementById('filter-run').value;
     const cell = document.getElementById('filter-cell').value;
     const sample = document.getElementById('filter-sample').value;
-    const rows = document.querySelectorAll('#cell-tbody tr');
+    const rows = document.querySelectorAll('#cell-table ' + CELL_ROWS);
     let shown = 0;
-    rows.forEach(r => {{
+    rows.forEach(r => {
       const match = (!run || r.dataset.run === run) &&
                     (!cell || r.dataset.cell === cell) &&
                     (!sample || r.dataset.sample === sample);
       r.style.display = match ? '' : 'none';
       if (match) shown++;
-    }});
-    document.getElementById('row-count').textContent = `Showing ${{shown}} of ${{rows.length}} cell(s)`;
-  }}
+    });
+    document.getElementById('row-count').textContent = `Showing ${shown} of ${rows.length} cell(s)`;
+    updateSums();
+    applyDataBars();
+  }
 
-  ['filter-run', 'filter-cell', 'filter-sample'].forEach(id =>
-    document.getElementById(id).addEventListener('change', applyFilters));
-  applyFilters();
+  const COLOR_ATTR = { sample: 'colorSample', run: 'colorRun', cell: 'colorCell' };
+  const NAME_ATTR  = { sample: 'sample',       run: 'run',       cell: 'cell' };
 
-  const COLOR_ATTR = {{ sample: 'colorSample', run: 'colorRun', cell: 'colorCell' }};
-  const NAME_ATTR  = {{ sample: 'sample',       run: 'run',       cell: 'cell' }};
-
-  function applyRowColors(mode) {{
-    document.querySelectorAll('#cell-tbody tr').forEach(r => {{
+  function applyRowColors(mode) {
+    document.querySelectorAll('#cell-table ' + CELL_ROWS).forEach(r => {
       const stripe = r.querySelector('td.color-stripe');
-      if (stripe) stripe.style.borderLeftColor = r.dataset[COLOR_ATTR[mode]];
-    }});
-  }}
+      if (stripe) stripe.style.boxShadow = `inset 4px 0 0 ${r.dataset[COLOR_ATTR[mode]]},inset -1px 0 0 #e2e8f0`;
+    });
+  }
 
-  function buildTableLegend(mode) {{
+  function buildTableLegend(mode) {
     const seen = new Map();
-    document.querySelectorAll('#cell-tbody tr').forEach(r => {{
+    document.querySelectorAll('#cell-table ' + CELL_ROWS).forEach(r => {
       const name = r.dataset[NAME_ATTR[mode]] || '(none)';
       if (!seen.has(name)) seen.set(name, r.dataset[COLOR_ATTR[mode]]);
-    }});
+    });
     const legend = document.getElementById('table-legend');
     legend.innerHTML = '';
-    seen.forEach((color, name) => {{
+    seen.forEach((color, name) => {
       const item = document.createElement('div');
       item.style.display = 'flex';
       item.style.alignItems = 'center';
       item.style.gap = '5px';
       item.innerHTML = `<span style="width:10px;height:10px;border-radius:3px;` +
-        `background:${{color}};display:inline-block;"></span>${{name}}`;
+        `background:${color};display:inline-block;"></span>${name}`;
       legend.appendChild(item);
-    }});
-  }}
+    });
+  }
 
-  document.getElementById('color-by-select').addEventListener('change', e => {{
+  document.getElementById('color-by-select').addEventListener('change', e => {
     applyRowColors(e.target.value);
     buildTableLegend(e.target.value);
-  }});
+  });
   applyRowColors('sample');
   buildTableLegend('sample');
 
   // ---------------------------------------------------------------------------
-  // DATA BARS: thin inset pill at the bottom of each numeric metric cell
-  // Largest visible value per column = 100% fill. Acquisition excluded.
+  // DATA BARS: thin inset pill under zero-based amounts (data-bar columns).
+  // Largest visible value per column = 100% fill.
   // ---------------------------------------------------------------------------
-  const METRIC_COL_INDICES = (function() {{
-    const ths = Array.from(document.querySelectorAll('#cell-table thead th'));
-    return ths.map((th, i) => th.dataset.metric === 'true' ? i : -1).filter(i => i >= 0);
-  }})();
+  const BAR_COL_INDICES = HEADER_THS.map((th, i) => th.dataset.bar === 'true' ? i : -1).filter(i => i >= 0);
 
-  function ensureTrack(td) {{
+  function ensureTrack(td) {
     let track = td.querySelector('.bar-track');
-    if (!track) {{
+    if (!track) {
       track = document.createElement('div');
       track.className = 'bar-track';
       const fill = document.createElement('div');
       fill.className = 'bar-fill';
       track.appendChild(fill);
       td.appendChild(track);
-    }}
+    }
     return track.querySelector('.bar-fill');
-  }}
+  }
 
-  function applyDataBars() {{
-    const rows = Array.from(
-      document.querySelectorAll('#cell-tbody tr')
-    ).filter(r => r.style.display !== 'none');
-
-    METRIC_COL_INDICES.forEach(ci => {{
+  function applyDataBars() {
+    const rows = visibleCellRows(document.getElementById('cell-table'));
+    BAR_COL_INDICES.forEach(ci => {
       let maxVal = 0;
-      rows.forEach(r => {{
+      rows.forEach(r => {
         const v = parseFloat(r.children[ci]?.dataset.value);
         if (!isNaN(v) && v > maxVal) maxVal = v;
-      }});
-      rows.forEach(r => {{
+      });
+      rows.forEach(r => {
         const td = r.children[ci];
         if (!td) return;
         const fill = ensureTrack(td);
         const v = parseFloat(td.dataset.value);
         fill.style.width = (!isNaN(v) && maxVal > 0)
-          ? `${{Math.round((v / maxVal) * 100)}}%`
+          ? `${Math.round((v / maxVal) * 100)}%`
           : '0%';
-      }});
-    }});
-  }}
+      });
+    });
+  }
 
-  // Patch sortTable to re-apply bars after each sort
-  (function() {{
-    const _orig = sortTable;
-    window.sortTable = function(th) {{ _orig(th); applyDataBars(); }};
-  }})();
-
-  // Re-apply bars when filters change
   ['filter-run', 'filter-cell', 'filter-sample'].forEach(id =>
-    document.getElementById(id).addEventListener('change', applyDataBars));
-
-  applyDataBars();
+    document.getElementById(id).addEventListener('change', applyFilters));
+  applyFilters();
 </script>
 
 <h3>Metric by Cell</h3>
 <div class="plot-container">
-  <iframe srcdoc="{bar_iframe}"
-          width="100%" height="600" frameborder="0"
-          scrolling="no" style="border:none;display:block;"></iframe>
+  <iframe srcdoc="%%BAR_IFRAME%%" height="600" frameborder="0" scrolling="no"></iframe>
 </div>
 
+%%REUSE_SECTION%%
 <h3>Metric Correlation</h3>
 <div class="plot-container">
-  <iframe srcdoc="{scatter_iframe}"
-          width="100%" height="600" frameborder="0"
-          scrolling="no" style="border:none;display:block;"></iframe>
+  <iframe srcdoc="%%SCATTER_IFRAME%%" height="600" frameborder="0" scrolling="no"></iframe>
 </div>
 
-<div class="footer">
-  Generated on {generated_on} &mdash; {title}
-</div>
+%%FOOTER%%
+%%PAGE_TIP%%
 </body>
 </html>
 """
 
 
 # ---------------------------------------------------------------------------
-# IFRAME: shared CSS block
+# IFRAMES: shared styles and JS (on top of report_common.CHART_HEAD)
 # ---------------------------------------------------------------------------
 
-_IFRAME_CSS = """\
-    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-         background:#fff;margin:0;padding:20px;color:#333;}}
-    #chart-container{{max-width:1020px;margin:0 auto;position:relative;}}
-    .tooltip{{position:absolute;padding:10px;font-size:13px;
-              background:rgba(255,255,255,.95);border:1px solid #ddd;border-radius:4px;
-              pointer-events:none;opacity:0;box-shadow:0 4px 6px rgba(0,0,0,.1);
-              white-space:nowrap;transition:opacity .2s;z-index:10;}}
-    .grid line{{stroke:#ddd;stroke-dasharray:4,4;}}
-    .grid path{{stroke-width:0;}}
-    .axis text{{font-size:12px;fill:#555;}}
-    .axis path,.axis line{{stroke:#bbb;}}
-    h2{{text-align:center;color:#222;margin-bottom:6px;font-size:1.1rem;}}
-    .controls{{display:flex;justify-content:center;align-items:center;gap:10px;
-               margin-bottom:14px;flex-wrap:wrap;}}
-    .controls label{{font-size:12.5px;color:#555;font-weight:600;}}
-    .controls select{{
+_IFRAME_EXTRA = """\
+  <style>
+    h2{font-size:1.1rem;}
+    .controls{display:flex;justify-content:center;align-items:center;gap:10px;
+               margin-bottom:14px;flex-wrap:wrap;}
+    .controls label{font-size:12.5px;color:#555;font-weight:600;}
+    .controls select{
       padding:5px 10px;font-size:12.5px;border:1px solid #cbd5e0;border-radius:6px;
-      background:#f8fafc;color:#2d3748;cursor:pointer;
-    }}
-    .legend-text{{font-size:12px;user-select:none;}}
-    .bar{{opacity:.9;}}
-    .bar:hover{{opacity:1;}}
-    .dot{{opacity:.85;stroke:#fff;stroke-width:1px;}}
-    .dot:hover{{opacity:1;}}
-"""
+      background:#f8fafc;color:#2d3748;cursor:pointer;max-width:100%;
+    }
+    .bar{opacity:.9;}
+    .bar:hover{opacity:1;}
+    .dot{opacity:.85;stroke:#fff;stroke-width:1px;}
+    .dot:hover{opacity:1;}
+  </style>
+  <script>
+    window.MAX_CHART_W = 1020;
+
+    // Group legend (by sample / run / flow cell): right of the plot when there
+    // is room, else in rows below. Click hides a group; build() redraws.
+    function groupLegendLayout(totalW, n) {
+      if (totalW >= NARROW) return {right: 160, below: false, cols: 1, height: 0};
+      const cols = Math.max(1, Math.floor((totalW - 30) / 180));
+      return {right: 16, below: true, cols, height: Math.ceil(n / cols) * 22 + 8};
+    }
+
+    function groupNameOf(r) {
+      if (colorMode === 'run') return r.run || 'Unknown';
+      if (colorMode === 'cell') return r.cellId || 'Unknown';
+      return r.sample || 'Unknown';
+    }
+
+    function drawGroupLegend(svg, W, H, legend, axisSpace, shape) {
+      const g = svg.append('g').attr('transform',
+        legend.below ? `translate(${-40},${H + axisSpace})` : `translate(${W + 14},0)`);
+      (groups[colorMode] || []).forEach((grp, i) => {
+        const hidden = hiddenGroups.has(grp.name);
+        const pos = legend.below
+          ? [(i % legend.cols) * 180, Math.floor(i / legend.cols) * 22 + 6]
+          : [0, i * 20];
+        const row = g.append('g').attr('class', 'legend-item')
+            .attr('transform', `translate(${pos[0]},${pos[1]})`)
+            .on('click', () => {
+              if (hidden) hiddenGroups.delete(grp.name); else hiddenGroups.add(grp.name);
+              build();
+            });
+        if (shape === 'circle') {
+          row.append('circle').attr('cx', 5.5).attr('cy', 5.5).attr('r', 5.5)
+             .attr('fill', hidden ? '#ccc' : grp.color);
+        } else {
+          row.append('rect').attr('width', 11).attr('height', 11).attr('rx', 2)
+             .attr('fill', hidden ? '#ccc' : grp.color);
+        }
+        row.append('text').attr('class', 'legend-text').attr('x', 16).attr('y', 9)
+           .attr('fill', hidden ? '#999' : '#333')
+           .style('text-decoration', hidden ? 'line-through' : 'none')
+           .text(grp.name);
+      });
+    }
+
+    function fillSelect(sel, options) {
+      sel.selectAll('option').data(options).join('option')
+         .attr('value', d => d.key).text(d => d.label);
+    }
+
+    // Tooltip for one SMRT cell: highlighted value rows first, then identity.
+    function cellTip(d, valueRows) {
+      return tipHtml(escTip(d.label), [
+        ...valueRows,
+        [null, 'Sample', escTip(d.sample)],
+        [null, 'Run', escTip(d.run)],
+        [null, 'Cell ID', `${escTip(d.cellId)}${d.metrics.acquisition_no > 1 ? ` (use ${d.metrics.acquisition_no})` : ''}`],
+      ]);
+    }
+  </script>"""
 
 
 # ---------------------------------------------------------------------------
@@ -708,16 +1005,14 @@ BAR_CHART_IFRAME = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
   <title>Metric by Cell</title>
-  <script src="https://d3js.org/d3.v7.min.js"></script>
-  <style>
-""" + _IFRAME_CSS + """\
-  </style>
+%%CHART_HEAD%%
+%%IFRAME_EXTRA%%
 </head>
 <body>
   <div id="chart-container">
     <h2 id="chart-title"></h2>
+%%EXPORT_BUTTONS%%
     <div class="controls">
       <label for="metric-select">Metric</label>
       <select id="metric-select"></select>
@@ -728,146 +1023,76 @@ BAR_CHART_IFRAME = """\
     <div class="tooltip" id="tooltip"></div>
   </div>
   <script>
-    const payload = {plot_data_json};
+    const payload = %%PLOT_DATA%%;
     const records = payload.records;
     const metrics = payload.metrics;
     const groups = payload.groups;
     const colorModes = payload.colorModes;
-    let colorMode = colorModes.length ? colorModes[0].key : "sample";
-
-    const select = d3.select("#metric-select");
-    select.selectAll("option")
-      .data(metrics)
-      .join("option")
-      .attr("value", d => d.key)
-      .text(d => d.label);
-
-    const colorSelect = d3.select("#color-by-select");
-    colorSelect.selectAll("option")
-      .data(colorModes)
-      .join("option")
-      .attr("value", d => d.key)
-      .text(d => d.label);
-    colorSelect.property("value", colorMode);
-
-    const margin = {{top:20,right:160,bottom:70,left:70}};
-    const W = 960 - margin.left - margin.right;
-    const H = 460 - margin.top - margin.bottom;
-
-    const svg = d3.select("#chart").append("svg")
-        .attr("width",  W + margin.left + margin.right)
-        .attr("height", H + margin.top  + margin.bottom)
-      .append("g")
-        .attr("transform", `translate(${{margin.left}},${{margin.top}})`);
-
-    const tooltip = d3.select("#tooltip");
-
-    const x = d3.scaleBand().range([0, W]).padding(0.3);
-    const y = d3.scaleLinear().range([H, 0]);
-
-    const gGrid  = svg.append("g").attr("class","grid");
-    const gXAxis = svg.append("g").attr("class","axis").attr("transform",`translate(0,${{H}})`);
-    const gYAxis = svg.append("g").attr("class","axis");
-
-    const yLabel = svg.append("text")
-       .attr("transform","rotate(-90)")
-       .attr("x", -H/2).attr("y", -55)
-       .attr("text-anchor","middle").attr("font-size","12px").attr("fill","#555");
-
-    const barsG = svg.append("g");
-
-    // Legend -- top-right of the plot area, inside the chart. Click to filter.
-    const legendG = svg.append("g").attr("transform", `translate(${{W+14}},0)`);
+    let colorMode = colorModes.length ? colorModes[0].key : 'sample';
     let hiddenGroups = new Set();
 
-    function groupNameOf(r) {{
-      if (colorMode === "run") return r.run || "Unknown";
-      if (colorMode === "cell") return r.cellId || "Unknown";
-      return r.sample || "Unknown";
-    }}
+    const select = d3.select('#metric-select');
+    fillSelect(select, metrics);
+    const colorSelect = d3.select('#color-by-select');
+    fillSelect(colorSelect, colorModes);
+    colorSelect.property('value', colorMode);
 
-    function renderLegend() {{
-      legendG.selectAll("*").remove();
-      (groups[colorMode] || []).forEach((g, i) => {{
-        const hidden = hiddenGroups.has(g.name);
-        const row = legendG.append("g")
-            .attr("transform", `translate(0,${{i*20}})`)
-            .style("cursor","pointer")
-            .on("click", function() {{
-              if (hiddenGroups.has(g.name)) hiddenGroups.delete(g.name);
-              else hiddenGroups.add(g.name);
-              renderLegend();
-              draw(select.property("value"));
-            }});
-        row.append("rect")
-            .attr("width",11).attr("height",11).attr("rx",2)
-            .attr("fill", hidden ? "#ccc" : g.color);
-        row.append("text")
-            .attr("class","legend-text")
-            .attr("x",16).attr("y",9)
-            .attr("fill", hidden ? "#999" : "#333")
-            .style("text-decoration", hidden ? "line-through" : "none")
-            .text(g.name);
-      }});
-    }}
+    function build() {
+      d3.select('#chart').selectAll('*').remove();
+      const metricKey = select.property('value');
+      const meta = metrics.find(m => m.key === metricKey) || {};
+      document.getElementById('chart-title').textContent = meta.label || metricKey;
 
-    function draw(metricKey) {{
-      const meta = metrics.find(m => m.key === metricKey) || {{}};
-      document.getElementById("chart-title").textContent = meta.label || metricKey;
+      const totalW = chartWidth();
+      const legend = groupLegendLayout(totalW, (groups[colorMode] || []).length);
+      const margin = {top: 20, right: legend.right, bottom: 70, left: 70};
+      const W = totalW - margin.left - margin.right;
+      const H = 460 - margin.top - margin.bottom;
+      const svg = appendSvg(totalW, margin, H, legend, 76);
 
       const data = records.filter(r => r.metrics[metricKey] !== null &&
-                                        r.metrics[metricKey] !== undefined &&
-                                        !hiddenGroups.has(groupNameOf(r)));
+                                       r.metrics[metricKey] !== undefined &&
+                                       !hiddenGroups.has(groupNameOf(r)));
 
-      x.domain(data.map(d => d.label));
-      const yMax = d3.max(data, d => d.metrics[metricKey]) || 1;
-      y.domain([0, yMax * 1.08]);
+      const x = d3.scaleBand().domain(data.map(d => d.label)).range([0, W]).padding(0.3);
+      const y = d3.scaleLinear()
+          .domain([0, (d3.max(data, d => d.metrics[metricKey]) || 1) * 1.08]).range([H, 0]);
 
-      gGrid.call(d3.axisLeft(y).tickSize(-W).tickFormat(""));
-      gXAxis.call(d3.axisBottom(x))
-            .selectAll("text")
-            .attr("transform", "rotate(-30)")
-            .style("text-anchor", "end");
-      gYAxis.call(d3.axisLeft(y).tickFormat(d3.format(",.2~f")));
-      yLabel.text(meta.label || metricKey);
+      svg.append('g').attr('class', 'grid').call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
+      svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
+         .call(d3.axisBottom(x))
+         .selectAll('text').attr('transform', 'rotate(-30)').style('text-anchor', 'end');
+      svg.append('g').attr('class', 'axis').call(d3.axisLeft(y).tickFormat(d3.format(',.2~f')));
+      axisLabel(svg, meta.label || metricKey, {transform: 'rotate(-90)', x: -H / 2, y: -55});
 
-      barsG.selectAll("rect").data(data, d => d.label)
-        .join("rect")
-        .attr("class", "bar")
-        .attr("x", d => x(d.label))
-        .attr("width", x.bandwidth())
-        .attr("fill", d => d.colors[colorMode])
-        .attr("y", d => y(d.metrics[metricKey]))
-        .attr("height", d => H - y(d.metrics[metricKey]))
-        .on("mousemove", function(event, d) {{
-          const val = d.metrics[metricKey];
-          const decimals = meta.decimals ?? 2;
-          tooltip.transition().duration(40).style("opacity",1);
-          tooltip.html(
-            `<strong>${{d.label}}</strong><br/>` +
-            `Sample: ${{d.sample}}<br/>` +
-            `Run: ${{d.run}}<br/>` +
-            `Cell ID: ${{d.cellId}}<br/>` +
-            `<span style="color:${{d.colors[colorMode]}}">&#9632;</span> ${{meta.label}}: ` +
-            `<b>${{d3.format(",." + decimals + "f")(val)}}</b>`
-          ).style("left",(event.pageX+15)+"px")
-           .style("top",Math.min(event.pageY-28, window.innerHeight-160)+"px");
-        }})
-        .on("mouseout", () => tooltip.transition().duration(200).style("opacity",0));
-    }}
+      const decimals = meta.decimals ?? 2;
+      svg.append('g').selectAll('rect').data(data, d => d.label)
+        .join('rect')
+        .attr('class', 'bar')
+        .attr('x', d => x(d.label))
+        .attr('width', x.bandwidth())
+        .attr('fill', d => d.colors[colorMode])
+        .attr('y', d => y(d.metrics[metricKey]))
+        .attr('height', d => H - y(d.metrics[metricKey]))
+        .on('mousemove', (event, d) => showTooltip(event, cellTip(d, [
+          [d.colors[colorMode], meta.label, d3.format(',.' + decimals + 'f')(d.metrics[metricKey])]])))
+        .on('mouseout', hideTooltip);
 
-    select.on("change", function() {{ draw(this.value); }});
-    colorSelect.on("change", function() {{
+      drawGroupLegend(svg, W, H, legend, 76, 'rect');
+      fitFrame();
+    }
+
+    select.on('change', build);
+    colorSelect.on('change', function () {
       colorMode = this.value;
       hiddenGroups = new Set();
-      renderLegend();
-      draw(select.property("value"));
-    }});
-    if (metrics.length) {{
-      select.property("value", metrics[0].key);
-      renderLegend();
-      draw(metrics[0].key);
-    }}
+      build();
+    });
+    if (metrics.length) {
+      select.property('value', metrics[0].key);
+      build();
+      onResize(build);
+    }
   </script>
 </body>
 </html>"""
@@ -881,16 +1106,14 @@ SCATTER_IFRAME = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
   <title>Metric Correlation</title>
-  <script src="https://d3js.org/d3.v7.min.js"></script>
-  <style>
-""" + _IFRAME_CSS + """\
-  </style>
+%%CHART_HEAD%%
+%%IFRAME_EXTRA%%
 </head>
 <body>
   <div id="chart-container">
     <h2 id="chart-title"></h2>
+%%EXPORT_BUTTONS%%
     <div class="controls">
       <label for="x-select">X axis</label>
       <select id="x-select"></select>
@@ -903,103 +1126,37 @@ SCATTER_IFRAME = """\
     <div class="tooltip" id="tooltip"></div>
   </div>
   <script>
-    const payload = {plot_data_json};
+    const payload = %%PLOT_DATA%%;
     const records = payload.records;
     const metrics = payload.metrics;
     const groups = payload.groups;
     const colorModes = payload.colorModes;
-    let colorMode = colorModes.length ? colorModes[0].key : "sample";
-
-    const xSelect = d3.select("#x-select");
-    const ySelect = d3.select("#y-select");
-    [xSelect, ySelect].forEach(sel => {{
-      sel.selectAll("option")
-        .data(metrics)
-        .join("option")
-        .attr("value", d => d.key)
-        .text(d => d.label);
-    }});
-
-    const colorSelect = d3.select("#color-by-select");
-    colorSelect.selectAll("option")
-      .data(colorModes)
-      .join("option")
-      .attr("value", d => d.key)
-      .text(d => d.label);
-    colorSelect.property("value", colorMode);
-
-    const margin = {{top:20,right:160,bottom:60,left:70}};
-    const W = 960 - margin.left - margin.right;
-    const H = 460 - margin.top - margin.bottom;
-
-    const svg = d3.select("#chart").append("svg")
-        .attr("width",  W + margin.left + margin.right)
-        .attr("height", H + margin.top  + margin.bottom)
-      .append("g")
-        .attr("transform", `translate(${{margin.left}},${{margin.top}})`);
-
-    const tooltip = d3.select("#tooltip");
-
-    const x = d3.scaleLinear().range([0, W]);
-    const y = d3.scaleLinear().range([H, 0]);
-
-    const gGrid  = svg.append("g").attr("class","grid");
-    const gXAxis = svg.append("g").attr("class","axis").attr("transform",`translate(0,${{H}})`);
-    const gYAxis = svg.append("g").attr("class","axis");
-
-    const xLabel = svg.append("text")
-       .attr("x", W/2).attr("y", H+45)
-       .attr("text-anchor","middle").attr("font-size","12px").attr("fill","#555");
-    const yLabel = svg.append("text")
-       .attr("transform","rotate(-90)")
-       .attr("x", -H/2).attr("y", -55)
-       .attr("text-anchor","middle").attr("font-size","12px").attr("fill","#555");
-
-    const dotsG = svg.append("g");
-
-    // Legend -- top-right of the plot area, inside the chart. Click to filter.
-    const legendG = svg.append("g").attr("transform", `translate(${{W+14}},0)`);
+    let colorMode = colorModes.length ? colorModes[0].key : 'sample';
     let hiddenGroups = new Set();
 
-    function groupNameOf(r) {{
-      if (colorMode === "run") return r.run || "Unknown";
-      if (colorMode === "cell") return r.cellId || "Unknown";
-      return r.sample || "Unknown";
-    }}
+    const xSelect = d3.select('#x-select');
+    const ySelect = d3.select('#y-select');
+    fillSelect(xSelect, metrics);
+    fillSelect(ySelect, metrics);
+    const colorSelect = d3.select('#color-by-select');
+    fillSelect(colorSelect, colorModes);
+    colorSelect.property('value', colorMode);
 
-    function renderLegend() {{
-      legendG.selectAll("*").remove();
-      (groups[colorMode] || []).forEach((g, i) => {{
-        const hidden = hiddenGroups.has(g.name);
-        const row = legendG.append("g")
-            .attr("transform", `translate(0,${{i*20}})`)
-            .style("cursor","pointer")
-            .on("click", function() {{
-              if (hiddenGroups.has(g.name)) hiddenGroups.delete(g.name);
-              else hiddenGroups.add(g.name);
-              renderLegend();
-              draw();
-            }});
-        row.append("circle")
-            .attr("cx",5.5).attr("cy",5.5).attr("r",5.5)
-            .attr("fill", hidden ? "#ccc" : g.color);
-        row.append("text")
-            .attr("class","legend-text")
-            .attr("x",16).attr("y",9)
-            .attr("fill", hidden ? "#999" : "#333")
-            .style("text-decoration", hidden ? "line-through" : "none")
-            .text(g.name);
-      }});
-    }}
+    function build() {
+      d3.select('#chart').selectAll('*').remove();
+      const xKey = xSelect.property('value');
+      const yKey = ySelect.property('value');
+      const xMeta = metrics.find(m => m.key === xKey) || {};
+      const yMeta = metrics.find(m => m.key === yKey) || {};
+      document.getElementById('chart-title').textContent =
+        `${yMeta.label || yKey} vs ${xMeta.label || xKey}`;
 
-    function draw() {{
-      const xKey = xSelect.property("value");
-      const yKey = ySelect.property("value");
-      const xMeta = metrics.find(m => m.key === xKey) || {{}};
-      const yMeta = metrics.find(m => m.key === yKey) || {{}};
-
-      document.getElementById("chart-title").textContent =
-        `${{yMeta.label || yKey}} vs ${{xMeta.label || xKey}}`;
+      const totalW = chartWidth();
+      const legend = groupLegendLayout(totalW, (groups[colorMode] || []).length);
+      const margin = {top: 20, right: legend.right, bottom: 60, left: 70};
+      const W = totalW - margin.left - margin.right;
+      const H = 460 - margin.top - margin.bottom;
+      const svg = appendSvg(totalW, margin, H, legend, 60);
 
       const data = records.filter(r =>
         r.metrics[xKey] !== null && r.metrics[xKey] !== undefined &&
@@ -1010,64 +1167,285 @@ SCATTER_IFRAME = """\
       const yExtent = d3.extent(data, d => d.metrics[yKey]);
       const xPad = (xExtent[1] - xExtent[0]) * 0.1 || 1;
       const yPad = (yExtent[1] - yExtent[0]) * 0.1 || 1;
-      x.domain([xExtent[0]-xPad, xExtent[1]+xPad]);
-      y.domain([yExtent[0]-yPad, yExtent[1]+yPad]);
+      const x = d3.scaleLinear().domain([xExtent[0] - xPad, xExtent[1] + xPad]).range([0, W]);
+      const y = d3.scaleLinear().domain([yExtent[0] - yPad, yExtent[1] + yPad]).range([H, 0]);
+      const ticks = Math.max(3, Math.min(8, Math.floor(W / 90)));
 
-      gGrid.call(d3.axisLeft(y).tickSize(-W).tickFormat(""));
-      gXAxis.call(d3.axisBottom(x).ticks(8).tickFormat(d3.format(",.2~f")));
-      gYAxis.call(d3.axisLeft(y).ticks(8).tickFormat(d3.format(",.2~f")));
-      xLabel.text(xMeta.label || xKey);
-      yLabel.text(yMeta.label || yKey);
+      svg.append('g').attr('class', 'grid').call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
+      svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
+         .call(d3.axisBottom(x).ticks(ticks).tickFormat(d3.format(',.2~f')));
+      svg.append('g').attr('class', 'axis')
+         .call(d3.axisLeft(y).ticks(8).tickFormat(d3.format(',.2~f')));
+      axisLabel(svg, xMeta.label || xKey, {x: W / 2, y: H + 45});
+      axisLabel(svg, yMeta.label || yKey, {transform: 'rotate(-90)', x: -H / 2, y: -55});
 
-      dotsG.selectAll("circle").data(data, d => d.label)
-        .join("circle")
-        .attr("class", "dot")
-        .attr("r", 6)
-        .attr("fill", d => d.colors[colorMode])
-        .attr("cx", d => x(d.metrics[xKey]))
-        .attr("cy", d => y(d.metrics[yKey]))
-        .on("mousemove", function(event, d) {{
-          const xd = xMeta.decimals ?? 2, yd = yMeta.decimals ?? 2;
-          tooltip.transition().duration(40).style("opacity",1);
-          tooltip.html(
-            `<strong>${{d.label}}</strong><br/>` +
-            `Sample: ${{d.sample}}<br/>` +
-            `Run: ${{d.run}}<br/>` +
-            `Cell ID: ${{d.cellId}}<br/>` +
-            `${{xMeta.label}}: <b>${{d3.format(",." + xd + "f")(d.metrics[xKey])}}</b><br/>` +
-            `${{yMeta.label}}: <b>${{d3.format(",." + yd + "f")(d.metrics[yKey])}}</b>`
-          ).style("left",(event.pageX+15)+"px")
-           .style("top",Math.min(event.pageY-28, window.innerHeight-160)+"px");
-        }})
-        .on("mouseout", () => tooltip.transition().duration(200).style("opacity",0));
-    }}
+      const xd = xMeta.decimals ?? 2, yd = yMeta.decimals ?? 2;
+      svg.append('g').selectAll('circle').data(data, d => d.label)
+        .join('circle')
+        .attr('class', 'dot')
+        .attr('r', 6)
+        .attr('fill', d => d.colors[colorMode])
+        .attr('cx', d => x(d.metrics[xKey]))
+        .attr('cy', d => y(d.metrics[yKey]))
+        .on('mousemove', (event, d) => showTooltip(event, cellTip(d, [
+          [d.colors[colorMode], yMeta.label, d3.format(',.' + yd + 'f')(d.metrics[yKey])],
+          [null, xMeta.label, d3.format(',.' + xd + 'f')(d.metrics[xKey])]])))
+        .on('mouseout', hideTooltip);
 
-    xSelect.on("change", draw);
-    ySelect.on("change", draw);
-    colorSelect.on("change", function() {{
+      drawGroupLegend(svg, W, H, legend, 60, 'circle');
+      fitFrame();
+    }
+
+    xSelect.on('change', build);
+    ySelect.on('change', build);
+    colorSelect.on('change', function () {
       colorMode = this.value;
       hiddenGroups = new Set();
-      renderLegend();
-      draw();
-    }});
+      build();
+    });
 
-    if (metrics.length) {{
-      xSelect.property("value", metrics.find(m => m.key === "loading_conc_pM") ? "loading_conc_pM" : metrics[0].key);
-      ySelect.property("value", metrics.find(m => m.key === "hifi_yield_gb") ? "hifi_yield_gb" : (metrics[1] || metrics[0]).key);
-      renderLegend();
-      draw();
-    }}
+    if (metrics.length) {
+      xSelect.property('value', metrics.find(m => m.key === 'loading_conc_pM') ? 'loading_conc_pM' : metrics[0].key);
+      ySelect.property('value', metrics.find(m => m.key === 'hifi_yield_gb') ? 'hifi_yield_gb' : (metrics[1] || metrics[0]).key);
+      build();
+      onResize(build);
+    }
   </script>
 </body>
 </html>"""
 
 
-def _html_escape_attr(s):
-    return (s.replace("&", "&amp;")
-             .replace('"', "&quot;")
-             .replace("<", "&lt;")
-             .replace(">", "&gt;")
-             .replace("'", "&#x27;"))
+# ---------------------------------------------------------------------------
+# IFRAME 3: SAMPLE SUMMARY -- HiFi yield per sample, one segment per cell
+# ---------------------------------------------------------------------------
+
+SAMPLE_IFRAME = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>HiFi Yield and Reads per Sample</title>
+%%CHART_HEAD%%
+%%IFRAME_EXTRA%%
+</head>
+<body>
+  <div id="chart-container">
+    <h2 id="chart-title">HiFi Yield and Reads per Sample</h2>
+%%EXPORT_BUTTONS%%
+    <div id="chart"></div>
+    <div class="tooltip" id="tooltip"></div>
+  </div>
+  <script>
+    const payload = %%PLOT_DATA%%;
+    let colorMode = 'sample';
+
+    // Two panels sharing the sample rows: HiFi yield and HiFi (Q20+) reads.
+    const fmtReads = n => n >= 1e6 ? (n / 1e6).toFixed(1) + ' M' : n.toLocaleString();
+    const PANELS = [
+      {key: 'hifi_yield_gb', title: 'HiFi yield (Gb)', label: 'HiFi yield', share: 'Share of sample yield',
+       fmt: v => v.toFixed(1) + ' Gb', tipFmt: v => v.toFixed(2) + ' Gb'},
+      {key: 'q20_reads', title: 'HiFi reads (Q20+)', label: 'HiFi reads', share: 'Share of sample reads',
+       fmt: fmtReads, tipFmt: v => Math.round(v).toLocaleString()},
+    ];
+
+    // One bar per sample and panel; each SMRT cell (acquisition) is a
+    // segment, in run order, with its [x0, x1] per panel.
+    const samples = [];
+    const bySample = new Map();
+    payload.records.forEach(r => {
+      const name = r.sample || 'Unknown';
+      if (!bySample.has(name)) {
+        const entry = {name, color: r.colors.sample, cells: [], totals: {}};
+        PANELS.forEach(p => { entry.totals[p.key] = 0; });
+        bySample.set(name, entry);
+        samples.push(entry);
+      }
+      const entry = bySample.get(name);
+      const seg = {};
+      PANELS.forEach(p => {
+        const v = r.metrics[p.key] || 0;
+        seg[p.key] = [entry.totals[p.key], entry.totals[p.key] + v];
+        entry.totals[p.key] += v;
+      });
+      entry.cells.push({r, seg});
+    });
+
+    function segmentTip(s, d, panel) {
+      const [x0, x1] = d.seg[panel.key];
+      return cellTip(d.r, [
+        ...PANELS.map((p, i) => [i === 0 ? s.color : null, p.label,
+                                 p.tipFmt(d.seg[p.key][1] - d.seg[p.key][0])]),
+        [null, panel.share,
+         `${(100 * (x1 - x0) / (s.totals[panel.key] || 1)).toFixed(0)}%`],
+      ]);
+    }
+
+    function build() {
+      d3.select('#chart').selectAll('*').remove();
+      const totalW = chartWidth();
+      const narrow = totalW < NARROW;   // panels stacked instead of side by side
+      const labelW = 96, gap = 44, valueW = 74, titleH = 22, axisH = 30;
+      const H = samples.length * 36;
+      const blockH = titleH + H + axisH;
+      const panelW = narrow ? totalW - labelW : (totalW - labelW - gap) / 2;
+      const W = Math.max(60, panelW - valueW);
+      const root = d3.select('#chart').append('svg')
+          .attr('width', totalW).attr('height', narrow ? 2 * blockH + 12 : blockH);
+      const y = d3.scaleBand().domain(samples.map(s => s.name)).range([0, H]).padding(0.25);
+
+      PANELS.forEach((panel, pi) => {
+        const ox = narrow ? labelW : labelW + pi * (panelW + gap);
+        const oy = (narrow ? pi * (blockH + 12) : 0) + titleH;
+        const g = root.append('g').attr('transform', `translate(${ox},${oy})`);
+        const x = d3.scaleLinear()
+            .domain([0, (d3.max(samples, s => s.totals[panel.key]) || 1) * 1.02]).range([0, W]);
+        const ticks = Math.max(2, Math.floor(W / 70));
+
+        g.append('text').attr('x', 0).attr('y', -8)
+         .style('font-size', '12.5px').style('font-weight', '600').style('fill', '#333')
+         .text(panel.title);
+        g.append('g').attr('class', 'grid').attr('transform', `translate(0,${H})`)
+         .call(d3.axisBottom(x).ticks(ticks).tickSize(-H).tickFormat(''));
+        g.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
+         .call(d3.axisBottom(x).ticks(ticks).tickFormat(panel.key === 'q20_reads' ? d3.format('.2~s') : null));
+
+        // Sample names (and cell counts) once per row of panels.
+        if (pi === 0 || narrow) {
+          samples.forEach(s => {
+            const n = s.cells.length;
+            const t = g.append('text').attr('x', -10).attr('text-anchor', 'end')
+              .attr('y', y(s.name) + y.bandwidth() / 2).style('font-size', '12px').style('fill', '#333');
+            t.append('tspan').attr('dy', '-0.1em').text(s.name);
+            t.append('tspan').attr('x', -10).attr('dy', '1.15em')
+             .style('font-size', '10.5px').style('fill', '#718096')
+             .text(`${n} cell${n === 1 ? '' : 's'}`);
+          });
+        }
+
+        samples.forEach(s => {
+          const row = g.append('g');
+          row.selectAll('rect').data(s.cells).join('rect')
+            .attr('class', 'bar')
+            .attr('x', d => x(d.seg[panel.key][0]))
+            .attr('y', y(s.name))
+            .attr('width', d => Math.max(0, x(d.seg[panel.key][1]) - x(d.seg[panel.key][0])))
+            .attr('height', y.bandwidth())
+            // Alternate shades so neighbouring cells stay distinguishable.
+            .attr('fill', (d, i) => i % 2 ? d3.color(s.color).brighter(0.55) : s.color)
+            .attr('stroke', '#fff').attr('stroke-width', 1)
+            .on('mousemove', (event, d) => showTooltip(event, segmentTip(s, d, panel)))
+            .on('mouseout', hideTooltip);
+          row.append('text').attr('class', 'legend-text')
+            .attr('x', x(s.totals[panel.key]) + 8).attr('y', y(s.name) + y.bandwidth() / 2)
+            .attr('dy', '0.35em').attr('fill', '#333').style('font-weight', '600')
+            .text(panel.fmt(s.totals[panel.key]));
+        });
+      });
+      fitFrame();
+    }
+
+    build();
+    onResize(build);
+  </script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# IFRAME 4: MULTI-USE CELLS -- a metric across acquisitions of the same cell
+# ---------------------------------------------------------------------------
+
+REUSE_IFRAME = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Multi-use Cells</title>
+%%CHART_HEAD%%
+%%IFRAME_EXTRA%%
+</head>
+<body>
+  <div id="chart-container">
+    <h2 id="chart-title"></h2>
+%%EXPORT_BUTTONS%%
+    <div class="controls">
+      <label for="metric-select">Metric</label>
+      <select id="metric-select"></select>
+    </div>
+    <div id="chart"></div>
+    <div class="tooltip" id="tooltip"></div>
+  </div>
+  <script>
+    const payload = %%PLOT_DATA%%;
+    const metrics = payload.metrics;
+    // Only cells acquired more than once; lines and legend are per cell.
+    const counts = d3.rollup(payload.records, v => v.length, r => r.cellId);
+    const records = payload.records.filter(r => counts.get(r.cellId) > 1);
+    const colorMode = 'cell';
+    const groups = {cell: payload.groups.cell.filter(g => counts.get(g.name) > 1)};
+    let hiddenGroups = new Set();
+
+    const select = d3.select('#metric-select');
+    fillSelect(select, metrics.filter(m => m.key !== 'acquisition_no'));
+
+    function build() {
+      d3.select('#chart').selectAll('*').remove();
+      const key = select.property('value');
+      const meta = metrics.find(m => m.key === key) || {};
+      document.getElementById('chart-title').textContent =
+        `${meta.label || key} by Acquisition (multi-use cells)`;
+
+      const totalW = chartWidth();
+      const legend = groupLegendLayout(totalW, groups.cell.length);
+      const margin = {top: 20, right: legend.right, bottom: 50, left: 70};
+      const W = totalW - margin.left - margin.right;
+      const H = 380 - margin.top - margin.bottom;
+      const svg = appendSvg(totalW, margin, H, legend, 56);
+
+      const data = records.filter(r => r.metrics[key] != null && r.metrics.acquisition_no != null &&
+                                       !hiddenGroups.has(r.cellId));
+      const lines = d3.groups(data, r => r.cellId)
+        .map(([cell, rs]) => [cell, rs.sort((a, b) => a.metrics.acquisition_no - b.metrics.acquisition_no)]);
+      const maxAcq = d3.max(records, r => r.metrics.acquisition_no) || 1;
+      const x = d3.scaleLinear().domain([0.8, maxAcq + 0.2]).range([0, W]);
+      const ext = d3.extent(data, r => r.metrics[key]);
+      const pad = (ext[1] - ext[0]) * 0.15 || Math.abs(ext[1] || 1) * 0.1;
+      const y = d3.scaleLinear().domain([ext[0] - pad, ext[1] + pad]).nice().range([H, 0]);
+
+      svg.append('g').attr('class', 'grid').call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
+      svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
+         .call(d3.axisBottom(x).tickValues(d3.range(1, maxAcq + 1)).tickFormat(d3.format('d')));
+      svg.append('g').attr('class', 'axis').call(d3.axisLeft(y).tickFormat(d3.format(',.2~f')));
+      axisLabel(svg, 'Acquisition', {x: W / 2, y: H + 42});
+      axisLabel(svg, meta.label || key, {transform: 'rotate(-90)', x: -H / 2, y: -55});
+
+      const line = d3.line().x(r => x(r.metrics.acquisition_no)).y(r => y(r.metrics[key]));
+      const decimals = meta.decimals ?? 2;
+      lines.forEach(([cell, rs]) => {
+        const color = rs[0].colors.cell;
+        svg.append('path').datum(rs).attr('fill', 'none').attr('stroke', color)
+           .attr('stroke-width', 2.5).attr('opacity', 0.85).attr('d', line);
+        svg.append('g').selectAll('circle').data(rs).join('circle')
+           .attr('class', 'dot').attr('r', 5.5).attr('fill', color)
+           .attr('cx', r => x(r.metrics.acquisition_no)).attr('cy', r => y(r.metrics[key]))
+           .on('mousemove', (event, r) => showTooltip(event, cellTip(r, [
+             [color, meta.label, d3.format(',.' + decimals + 'f')(r.metrics[key])]])))
+           .on('mouseout', hideTooltip);
+      });
+
+      drawGroupLegend(svg, W, H, legend, 56, 'circle');
+      fitFrame();
+    }
+
+    select.on('change', build);
+    select.property('value', metrics.find(m => m.key === 'hifi_yield_gb') ? 'hifi_yield_gb' : metrics[0].key);
+    build();
+    onResize(build);
+  </script>
+</body>
+</html>"""
+
+
+def _render_iframe(template, payload, title):
+    return render_chart_iframe(template, payload, title, iframe_extra=_IFRAME_EXTRA)
 
 
 # ---------------------------------------------------------------------------
@@ -1085,27 +1463,50 @@ def generate_report(files, title, out_path):
     print(f"Loaded {len(cells)} SMRT cell(s) across {n_runs} run(s) from {len(files)} file(s).")
 
     payload = build_chart_payload(cells)
-    json_str = json.dumps(payload, separators=(",", ":"))
+    bar_iframe = _render_iframe(BAR_CHART_IFRAME, payload, "Metric by Cell")
+    scatter_iframe = _render_iframe(SCATTER_IFRAME, payload, "Metric Correlation")
+    sample_iframe = _render_iframe(SAMPLE_IFRAME, payload, "HiFi Yield and Reads per Sample")
+    n_samples = len({rec["sample_name"] or rec["run_name"] for rec in cells})
 
-    bar_iframe = _html_escape_attr(BAR_CHART_IFRAME.format(plot_data_json=json_str))
-    scatter_iframe = _html_escape_attr(SCATTER_IFRAME.format(plot_data_json=json_str))
+    # The multi-use chart only appears when some cell was acquired more than once.
+    cell_uses = {}
+    for rec in cells:
+        cell_uses[rec["cell_id"]] = cell_uses.get(rec["cell_id"], 0) + 1
+    reuse_section = ""
+    if any(n > 1 for cid, n in cell_uses.items() if cid):
+        reuse_iframe = _render_iframe(REUSE_IFRAME, payload, "Multi-use Cells")
+        reuse_section = (
+            "<h3>Multi-use Cells</h3>\n<div class=\"plot-container\">\n"
+            f"  <iframe srcdoc=\"{reuse_iframe}\" height=\"520\" frameborder=\"0\" "
+            "scrolling=\"no\"></iframe>\n</div>\n")
 
-    table_rows = "\n".join(render_table_row(rec) for rec in cells)
-    table_footer = render_table_footer(cells)
 
-    report = HTML_TEMPLATE.format(
+    generated_on = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # d3 goes last: it is large and must not be searched for later tokens.
+    report = fill(
+        HTML_TEMPLATE,
         title=title,
+        table_csv_js=TABLE_CSV_JS,
         n_cells=len(cells),
         n_runs=n_runs,
         table_header=render_table_header(),
-        table_rows=table_rows,
-        table_footer=table_footer,
+        table_bodies=render_table_body(cells),
+        read_length_guide_css=read_length_guide_css(_max_read_bp(cells)),
+        table_footer=render_table_footer(),
+        table_legend=render_table_legend(),
+        sample_iframe=sample_iframe,
+        sample_iframe_h=170 + 36 * n_samples,
+        reuse_section=reuse_section,
         filter_run_options=render_filter_options(cells, "run_name"),
         filter_cell_options=render_filter_options(cells, "cell_id"),
         filter_sample_options=render_filter_options(cells, "sample_name"),
         bar_iframe=bar_iframe,
         scatter_iframe=scatter_iframe,
-        generated_on=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        generated_on=generated_on,
+        footer=footer_html(title, generated_on),
+        page_tip=PAGE_TIP,
+        d3_source=D3_SOURCE_TAG,
+        d3_js=load_d3(),
     )
 
     Path(out_path).write_text(report, encoding="utf-8")
@@ -1126,8 +1527,8 @@ def main():
                         help="run-qc-export.csv file(s). Auto-discovered if omitted.")
     parser.add_argument("--title", default="HiFi Sequencing Report",
                         help="Report title (default: 'HiFi Sequencing Report')")
-    parser.add_argument("--out", default="report.html",
-                        help="Output HTML file (default: report.html)")
+    parser.add_argument("--out", default="hifi-report.html",
+                        help="Output HTML file (default: hifi-report.html)")
     args = parser.parse_args()
 
     files = sorted(args.files or glob.glob("*qc-export*.csv"))

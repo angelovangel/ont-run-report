@@ -52,19 +52,35 @@ sidebar <- sidebar(
 
     tags$hr(class = 'my-1'),
 
-    # ---- ONT-only: number of flow cells ----
+    # ---- ONT: all MinKNOW CSVs at once, paired by run ID ----
     conditionalPanel(
       condition = "input.seq_type == 'ont'",
-      selectInput('num_runs',
+      fileInput('ont_files',
         label = tags$span(
-          "Number of flow cells", class = "small fw-semibold",
+          "MinKNOW CSV files", class = "small fw-semibold",
           tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
-                  "How many ONT flow cells to include in the report.", placement = "left")
+                  "Select the pore_activity_*.csv and throughput_*.csv files for all flow cells at once.",
+                  "They are paired by the run ID in their file names.", placement = "right")
         ),
-        choices = 1:8, selected = 2)
+        accept = ".csv", buttonLabel = "Browse…",
+        placeholder = "pore_activity + throughput CSVs", multiple = TRUE
+      ),
+      uiOutput('ont_pairs_ui')
     ),
 
-    uiOutput('file_inputs_ui'),
+    # ---- HiFi: run-qc-export CSVs ----
+    conditionalPanel(
+      condition = "input.seq_type == 'hifi'",
+      fileInput('hifi_files',
+        label = tags$span(
+          "run-qc-export CSV file(s)", class = "small fw-semibold",
+          tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
+                  "One or more *run-qc-export*.csv files exported from SMRT Link.", placement = "right")
+        ),
+        accept = ".csv", buttonLabel = "Browse…",
+        placeholder = "Select CSV file(s)", multiple = TRUE
+      )
+    ),
 
     layout_columns(
       col_widths = c(7, 5), gap = '0.5rem', class = 'mt-1',
@@ -176,8 +192,34 @@ server <- function(input, output, session) {
     work_dir     = NULL,
     inner_script = NULL,
     is_running   = FALSE,
-    show_log     = FALSE
+    show_log     = FALSE,
+    # fileInput values survive shinyjs::reset(); this hides them until the next upload
+    ont_cleared  = FALSE,
+    nx_slots     = 0
   )
+
+  observeEvent(input$ont_files, rv$ont_cleared <- FALSE)
+
+  ont_pairs <- reactive({
+    f <- input$ont_files
+    if (rv$ont_cleared || is.null(f) || nrow(f) == 0) {
+      return(list(pairs = list(), unmatched = character(0)))
+    }
+    pair_ont_files(f)
+  })
+
+  # Labels typed in the flow-cell panels, falling back to the flow cell ID.
+  ont_labels <- function(pairs) {
+    vapply(seq_along(pairs), function(i) {
+      lbl <- input[[paste0("label_", i)]]
+      if (nzchar(lbl %||% "")) lbl else pairs[[i]]$label
+    }, character(1))
+  }
+
+  # Clear browser-computed Nx values for every flow-cell slot used so far.
+  reset_nx_summaries <- function() {
+    for (i in seq_len(max(rv$nx_slots, 1))) session$sendCustomMessage("resetNxSummary", i)
+  }
 
   # Remove only the files/dirs belonging to THIS session. Never glob the
   # shared app_tmp_dir by pattern - other sessions may have runs in flight
@@ -196,7 +238,7 @@ server <- function(input, output, session) {
 
   # When switching sequencer type, reset the report title default
   observeEvent(input$seq_type, {
-    for (i in 1:8) session$sendCustomMessage("resetNxSummary", i)
+    reset_nx_summaries()
     current_title <- input$report_title %||% ""
     if (input$seq_type == 'hifi' && current_title %in% c('', 'ONT Run Report')) {
       updateTextInput(session, 'report_title', value = 'HiFi Sequencing Report')
@@ -205,8 +247,11 @@ server <- function(input, output, session) {
     }
   }, ignoreInit = TRUE)
 
-  observeEvent(input$num_runs, {
-    for (i in 1:8) session$sendCustomMessage("resetNxSummary", i)
+  # Flow-cell panels are re-rendered when the pairing changes, so Nx values
+  # computed for the previous panels no longer belong to the same flow cells.
+  observeEvent(ont_pairs(), {
+    isolate(reset_nx_summaries())
+    rv$nx_slots <- max(isolate(rv$nx_slots), length(ont_pairs()$pairs))
   }, ignoreInit = TRUE)
 
   # Check scripts on startup
@@ -224,122 +269,64 @@ server <- function(input, output, session) {
   })
 
   # ---------------------------------------------------------------------------
-  # Dynamic file input UI
+  # ONT flow cells: one panel per paired run (label + optional summary)
   # ---------------------------------------------------------------------------
-  output$file_inputs_ui <- renderUI({
-    seq_type <- input$seq_type %||% 'ont'
+  output$ont_pairs_ui <- renderUI({
+    p <- ont_pairs()
+    if (!length(p$pairs) && !length(p$unmatched)) {
+      return(tags$small(class = "form-text text-muted d-block mb-2",
+        "Select every pore_activity and throughput CSV together; files from the same run are paired automatically."))
+    }
 
-    if (seq_type == 'hifi') {
-      # HiFi: single multi-file input for run-qc-export CSVs
-      tagList(
-        fileInput('hifi_files',
-          label = tags$span(
-            "run-qc-export CSV file(s)", class = "small fw-semibold",
-            tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
-                    "One or more *run-qc-export*.csv files exported from SMRT Link.", placement = "right")
+    panels <- lapply(seq_along(p$pairs), function(i) {
+      pair <- p$pairs[[i]]
+      accordion_panel(
+        value = paste0("Run ", i),
+        title = tagList(tags$span(class = "status-dot status-green"), pair$flow_cell),
+        icon = bs_icon("hdd-stack"),
+        textInput(paste0("label_", i), label = "Label", value = pair$label),
+        tags$small(class = "form-text text-muted d-block mb-2 text-break",
+          style = "font-size:10.5px;line-height:1.35;",
+          pair$pa_name, tags$br(), pair$tp_name),
+        div(class = "mb-2 nx-summary-control",
+          tags$label(
+            "sequencing_summary (optional)",
+            `for` = paste0("sequencing_summary_file_", i),
+            class = "form-label small"
           ),
-          accept = ".csv", buttonLabel = "Browse…",
-          placeholder = "Select CSV file(s)", multiple = TRUE
-        )
-      )
-    } else {
-      # ONT: per-flow-cell accordion with pore_activity + throughput
-      n <- req(as.integer(input$num_runs))
-      panels <- lapply(seq_len(n), function(i) {
-        accordion_panel(
-          value = paste0("Run ", i),
-          title = tagList(
-            tags$span(id = paste0("status_dot_", i), class = "status-dot status-red"),
-            paste0("Run ", i)
+          tags$input(
+            type = "file",
+            id = paste0("sequencing_summary_file_", i),
+            accept = ".txt,.tsv",
+            class = "form-control form-control-sm nx-summary-file"
           ),
-          icon = bs_icon("hdd-stack"),
-          textInput(paste0("label_", i), label = "Label", value = paste0("Run ", i)),
-          layout_columns(
-            col_widths = c(6, 6), gap = '0.4rem',
-            fileInput(paste0("pore_activity_", i),
-              label = tags$span("pore_activity", class = "small",
-                tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:3px;cursor:pointer;"),
-                        "pore_activity_*.csv generated by MinKNOW during run.", placement = "right")),
-              accept = ".csv", buttonLabel = "Browse…",
-              placeholder = "CSV"),
-            fileInput(paste0("throughput_", i),
-              label = tags$span("throughput", class = "small",
-                tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:3px;cursor:pointer;"),
-                        "throughput_*.csv generated by MinKNOW during run.", placement = "right")),
-              accept = ".csv", buttonLabel = "Browse…",
-              placeholder = "CSV")
-          ),
-          div(class = "mb-2 nx-summary-control",
-            tags$label(
-              paste0("sequencing_summary (optional) — Run ", i),
-              `for` = paste0("sequencing_summary_file_", i),
-              class = "form-label small"
-            ),
-            tags$input(
-              type = "file",
-              id = paste0("sequencing_summary_file_", i),
-              accept = ".txt,.tsv",
-              class = "form-control form-control-sm nx-summary-file"
-            ),
-            tags$small(
-              id = paste0("sequencing_summary_status_", i),
-              class = "form-text text-muted",
-              ""
-            )
+          tags$small(
+            id = paste0("sequencing_summary_status_", i),
+            class = "form-text text-muted",
+            ""
           )
         )
-      })
-      do.call(accordion, c(
-        list(id = 'flowcell_accordion', open = FALSE, multiple = TRUE, class = 'mb-1'),
-        panels
-      ))
-    }
-  })
-
-  # ---------------------------------------------------------------------------
-  # Per-run status dot (yellow = files needed, green = ready)
-  # Created once for the max possible number of runs so they persist across
-  # changes to num_runs (the accordion panels get re-rendered each time).
-  # ---------------------------------------------------------------------------
-  lapply(1:8, function(i) {
-    observe({
-      pa <- input[[paste0("pore_activity_", i)]]
-      tp <- input[[paste0("throughput_", i)]]
-      pa_ok <- !is.null(pa) && nrow(pa) > 0
-      tp_ok <- !is.null(tp) && nrow(tp) > 0
-      n_ok  <- sum(pa_ok, tp_ok)
-
-      mismatch <- FALSE
-      if (pa_ok && tp_ok) {
-        pa_suffix <- sub("^pore_activity_", "", pa$name[1])
-        tp_suffix <- sub("^throughput_",    "", tp$name[1])
-        mismatch  <- !identical(pa_suffix, tp_suffix)
-      }
-
-      state <- if (mismatch)     "status-red"
-               else if (n_ok == 2) "status-green"
-               else if (n_ok == 1) "status-yellow"
-               else                "status-red"
-      all_states <- c("status-red", "status-yellow", "status-green")
-
-      dot_id <- paste0("status_dot_", i)
-      shinyjs::removeClass(id = dot_id, class = paste(setdiff(all_states, state), collapse = " "))
-      shinyjs::addClass(id = dot_id, class = state)
-
-      # Warn if the pore_activity/throughput filenames' hash suffixes don't match
-      if (mismatch) {
-        sendSweetAlert(
-          title = "File mismatch",
-          text  = sprintf(
-            "The pore_activity and throughput files for Run %d don't look like they're from the same run:\n%s\n%s",
-            i, pa$name[1], tp$name[1]
-          ),
-          type = "warning", btn_labels = "OK", showCloseButton = TRUE
-        )
-      } else if (n_ok == 2) {
-        accordion_panel_close("flowcell_accordion", paste0("Run ", i))
-      }
+      )
     })
+
+    tagList(
+      if (length(p$unmatched)) {
+        div(class = "alert alert-warning py-1 px-2 small mb-2",
+          bs_icon("exclamation-triangle", class = "me-1"),
+          tags$strong("Not paired, will be ignored: "),
+          paste(p$unmatched, collapse = ", "))
+      },
+      if (length(panels)) {
+        tagList(
+          tags$small(class = "form-text text-muted d-block mb-1",
+            sprintf("%d flow cell%s paired", length(panels), if (length(panels) == 1) "" else "s")),
+          do.call(accordion, c(
+            list(id = 'flowcell_accordion', open = FALSE, multiple = TRUE, class = 'mb-1'),
+            panels
+          ))
+        )
+      }
+    )
   })
 
   # ---------------------------------------------------------------------------
@@ -351,12 +338,7 @@ server <- function(input, output, session) {
       hf <- input$hifi_files
       !is.null(hf) && nrow(hf) > 0
     } else {
-      n <- req(as.integer(input$num_runs))
-      all(vapply(seq_len(n), function(i) {
-        pa <- input[[paste0("pore_activity_", i)]]
-        tp <- input[[paste0("throughput_", i)]]
-        !is.null(pa) && nrow(pa) > 0 && !is.null(tp) && nrow(tp) > 0
-      }, logical(1)))
+      length(ont_pairs()$pairs) > 0
     }
 
     if (all_ready && !rv$is_running) shinyjs::enable('start')
@@ -394,25 +376,24 @@ server <- function(input, output, session) {
         file_args <- if (!is.null(hf) && nrow(hf) > 0) hf$name else "[run-qc-export.csv ...]"
         cat("generate-hifi-report.py \\\n")
         cat(sprintf("  --title %s \\\n", shQuote(input$report_title %||% "HiFi Sequencing Report")))
-        cat("  --out report.html \\\n")
+        cat("  --out hifi-report.html \\\n")
         cat("  ", paste(shQuote(file_args), collapse = " "), "\n")
       } else {
-        n <- req(as.integer(input$num_runs))
+        pairs <- ont_pairs()$pairs
+        n <- length(pairs)
         cat(sprintf("generate-ont-report.py \\\n"))
         cat(sprintf("  --title %s \\\n", shQuote(input$report_title %||% "ONT Run Report")))
         cat(sprintf("  --sample-hz %s \\\n", input$sample_hz %||% 5))
-        cat("  --out report.html \\\n")
-        pa_names  <- character(n); tp_names  <- character(n); lbls <- character(n)
-        nx_values <- vector("list", n)
-        for (i in seq_len(n)) {
-          pa  <- input[[paste0("pore_activity_", i)]]
-          tp  <- input[[paste0("throughput_", i)]]
-          nx_values[[i]] <- input[[paste0("sequencing_summary_nx_", i)]]
-          lbl <- input[[paste0("label_", i)]]
-          pa_names[i] <- if (!is.null(pa) && nrow(pa) > 0) pa$name[1] else paste0("[pore_activity_", i, ".csv]")
-          tp_names[i] <- if (!is.null(tp) && nrow(tp) > 0) tp$name[1] else paste0("[throughput_",    i, ".csv]")
-          lbls[i]     <- if (nzchar(lbl %||% "")) lbl else paste0("Run ", i)
+        cat("  --out ont-report.html \\\n")
+        if (n == 0) {
+          cat("  --pore-activity [pore_activity_*.csv ...] \\\n")
+          cat("  --throughput [throughput_*.csv ...]\n")
+          return(invisible())
         }
+        pa_names  <- vapply(pairs, `[[`, character(1), "pa_name")
+        tp_names  <- vapply(pairs, `[[`, character(1), "tp_name")
+        lbls      <- ont_labels(pairs)
+        nx_values <- lapply(seq_len(n), function(i) input[[paste0("sequencing_summary_nx_", i)]])
         cat("  --pore-activity", paste(shQuote(pa_names), collapse = " "), "\\\n")
         cat("  --throughput",    paste(shQuote(tp_names), collapse = " "), "\\\n")
         has_nx <- !vapply(nx_values, is.null, logical(1))
@@ -468,7 +449,7 @@ server <- function(input, output, session) {
   observeEvent(input$start, {
     seq_type <- input$seq_type %||% 'ont'
     if (seq_type != 'hifi') {
-      n <- as.integer(input$num_runs)
+      n <- length(ont_pairs()$pairs)
       nx_values <- lapply(seq_len(n), function(i) {
         input[[paste0("sequencing_summary_nx_", i)]]
       })
@@ -488,8 +469,9 @@ server <- function(input, output, session) {
 
     log_file     <- file.path(app_tmp_dir, paste0("run_", run_id, ".log"))
     status_file  <- file.path(app_tmp_dir, paste0("run_", run_id, ".status"))
-    report_file  <- file.path(work_dir, "report.html")
-    report_url   <- file.path("reports", basename(work_dir), "report.html")
+    report_name  <- report_file_name(seq_type)
+    report_file  <- file.path(work_dir, report_name)
+    report_url   <- file.path("reports", basename(work_dir), report_name)
     inner_script <- file.path(app_tmp_dir, paste0("run_", run_id, ".sh"))
 
     title_arg <- if (nzchar(input$report_title %||% "")) input$report_title else
@@ -512,26 +494,22 @@ server <- function(input, output, session) {
       )
     } else {
       # ---- ONT mode ----
-      n <- as.integer(input$num_runs)
-      pa_paths <- character(n); tp_paths <- character(n); lbl_args <- character(n)
+      pairs <- ont_pairs()$pairs
+      n <- length(pairs)
+      pa_paths <- character(n); tp_paths <- character(n)
+      lbl_args <- ont_labels(pairs)
       nx_values <- lapply(seq_len(n), function(i) {
         input[[paste0("sequencing_summary_nx_", i)]]
       })
       use_nx <- !is.null(nx_values[[1]])
 
       for (i in seq_len(n)) {
-        pa  <- input[[paste0("pore_activity_", i)]]
-        tp  <- input[[paste0("throughput_",    i)]]
-        lbl <- input[[paste0("label_",         i)]]
-
-        pa_dest <- file.path(work_dir, pa$name[1])
-        tp_dest <- file.path(work_dir, tp$name[1])
-        file.copy(pa$datapath[1], pa_dest, overwrite = TRUE)
-        file.copy(tp$datapath[1], tp_dest, overwrite = TRUE)
-
+        pa_dest <- file.path(work_dir, pairs[[i]]$pa_name)
+        tp_dest <- file.path(work_dir, pairs[[i]]$tp_name)
+        file.copy(pairs[[i]]$pa_path, pa_dest, overwrite = TRUE)
+        file.copy(pairs[[i]]$tp_path, tp_dest, overwrite = TRUE)
         pa_paths[i] <- pa_dest
         tp_paths[i] <- tp_dest
-        lbl_args[i] <- if (nzchar(lbl %||% "")) lbl else paste0("Run ", i)
       }
 
       nx_arg <- if (use_nx) {
@@ -600,10 +578,7 @@ server <- function(input, output, session) {
   })
 
   output$download_report <- downloadHandler(
-    filename = function() {
-      title_arg <- if (nzchar(input$report_title %||% "")) input$report_title else "ONT Run Report"
-      paste0(gsub("[^A-Za-z0-9_-]+", "_", title_arg), ".html")
-    },
+    filename = function() basename(rv$report_file %||% report_file_name(input$seq_type %||% 'ont')),
     content = function(file) {
       req(rv$report_file)
       file.copy(rv$report_file, file)
@@ -626,19 +601,12 @@ server <- function(input, output, session) {
     rv$show_log     <- FALSE
 
     updateRadioButtons(session, "seq_type",      selected = 'ont')
-    updateSelectInput(session,  "num_runs",      selected = 2)
     updateTextInput(session,    "report_title",  value = "ONT Run Report")
     updateNumericInput(session, "sample_hz",     value = 5)
     shinyjs::reset('hifi_files')
-    for (i in 1:8) {
-      shinyjs::reset(paste0("pore_activity_", i))
-      shinyjs::reset(paste0("throughput_", i))
-      session$sendCustomMessage("resetNxSummary", i)
-      updateTextInput(session, paste0("label_", i), value = paste0("Run ", i))
-      dot_id <- paste0("status_dot_", i)
-      shinyjs::removeClass(id = dot_id, class = "status-yellow status-green")
-      shinyjs::addClass(id = dot_id, class = "status-red")
-    }
+    shinyjs::reset('ont_files')
+    rv$ont_cleared <- TRUE
+    reset_nx_summaries()
     shinyjs::hide('download_panel')
     shinyjs::enable('reset')
   })

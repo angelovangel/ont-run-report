@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the Python report-generation scripts and make them executable
 COPY bin/generate-ont-report.py  /usr/local/bin/generate-ont-report.py
 COPY bin/generate-hifi-report.py /usr/local/bin/generate-hifi-report.py
+# Shared report code and d3 (embedded into the reports), read from next to the scripts
+COPY bin/report_common.py        /usr/local/bin/report_common.py
+COPY bin/d3.v7.9.0.min.js        /usr/local/bin/d3.v7.9.0.min.js
 RUN chmod +x /usr/local/bin/generate-ont-report.py \
              /usr/local/bin/generate-hifi-report.py
 

@@ -11,3 +11,6 @@ renv/library/
 .DS_Store
 .DS_Store
 report.html
+__pycache__/
+ont-report.html
+hifi-report.html

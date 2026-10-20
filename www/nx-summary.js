@@ -220,15 +220,17 @@
 
   document.addEventListener("click", function (event) {
     if (event.target.closest("#reset")) {
-      for (let run = 1; run <= 8; run += 1) {
-        const input = document.getElementById(`sequencing_summary_file_${run}`);
-        if (input) {
-          input.dataset.nxToken = String(Number(input.dataset.nxToken || 0) + 1);
-          input.value = "";
-          setStatus(input, "Sampled locally; only estimated Nx values are sent to the server.", "");
-        }
-        Shiny.setInputValue(`sequencing_summary_nx_${run}`, null, { priority: "event" });
-      }
+      // The server also clears every slot it has used (resetNxSummary).
+      document.querySelectorAll("input.nx-summary-file").forEach(input => {
+        input.dataset.nxToken = String(Number(input.dataset.nxToken || 0) + 1);
+        input.value = "";
+        setStatus(input, "Sampled locally; only estimated Nx values are sent to the server.", "");
+        Shiny.setInputValue(
+          input.id.replace("sequencing_summary_file_", "sequencing_summary_nx_"),
+          null,
+          { priority: "event" }
+        );
+      });
       return;
     }
 
