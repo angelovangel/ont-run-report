@@ -29,6 +29,24 @@ These files are found inside the run directory produced by MinKNOW, typically un
 
 ---
 
+#### Command line
+
+The report script also runs on its own (Python 3, no extra packages). Give it
+MinKNOW run folders and/or files in any order; files are matched by the run ID
+in their names and folders are searched recursively:
+
+```bash
+bin/generate-ont-report.py /data/run1 /data/run2 \
+    -l PBC87221=Liver PBE26402=Blood -t "Week 42" -o week42.html
+```
+
+With no inputs it searches the current folder. Labels default to the flow cell
+ID; `-l` takes `FLOWCELL=label` (or `RUNID=label`), or plain labels in the
+order the runs are listed. The Nx plot is added when every run has a
+`sequencing_summary_*.txt`. See `bin/generate-ont-report.py -h` for all options.
+
+---
+
 ### PacBio HiFi mode
 
 Upload one or more `*run-qc-export*.csv` files exported from **SMRT Link** (one file per run / instrument). Multiple files are merged into a single report, which includes:

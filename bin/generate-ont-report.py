@@ -1,45 +1,46 @@
 #!/usr/bin/env python3
 """
-generate_report.py
-==================
-Generate an interactive HTML report for ONT PromethION sequencing runs
-from a set of pore_activity and throughput CSV files.
+generate-ont-report.py
+======================
+Generate an interactive HTML report for ONT (PromethION/MinION) sequencing
+runs from MinKNOW's pore_activity_*.csv and throughput_*.csv files, plus
+optional sequencing_summary_*.txt files for a read-length Nx plot.
 
 Usage
 -----
-  python generate_report.py [OPTIONS]
+  generate-ont-report.py [INPUT ...] [-o OUT] [-t TITLE] [-l LABEL ...]
+
+INPUT is any mix of MinKNOW files and run folders (searched recursively);
+with no INPUT the current folder is searched. Files are matched by the run
+ID in their names (pore_activity_<run>.csv, throughput_<run>.csv,
+sequencing_summary_<run>.txt), so their order doesn't matter. The Nx plot
+is included when every run has a sequencing summary.
 
 Options
 -------
-  --pore-activity FILE [FILE ...]   One or more pore_activity_*.csv files.
-                                    If omitted, auto-discovered in CWD.
-  --throughput   FILE [FILE ...]    One or more throughput_*.csv files.
-                                    If omitted, auto-discovered in CWD.
-  --sequencing-summary FILE [...]  Optional ONT sequencing_summary.txt/TSV
-                                    files (one per sample, in matching order).
-  --nx-values JSON                 Precomputed Nx point arrays, one per sample.
-  --labels       LABEL [LABEL ...]  Human-readable sample labels (must match
-                                    the file order). Auto-derived if omitted.
-  --title        TEXT               Report title (default: "ONT Sequencing Report").
-  --out          PATH               Output HTML file (default: ont-report.html).
-  --sample-hz    INT                Sampling interval for the Active-Pores plot,
-                                    in minutes (default: 5).
+  -o, --out PATH        Output HTML file (default: ont-report.html).
+  -t, --title TEXT      Report title (default: "ONT Sequencing Report").
+  -l, --labels LABEL …  Sample labels. Either NAME=LABEL, where NAME is a flow
+                        cell or run ID (e.g. PBC87221=Liver), or plain labels
+                        in the order the runs are listed. Default: flow cell ID.
+  --sample-hz MIN       Sampling interval of the active-pores plot (default: 5).
+
+  --pore-activity, --throughput, --sequencing-summary FILE …
+                        Give files of one kind explicitly, e.g. when they were
+                        renamed. Files whose names share no run ID are paired
+                        in the order given.
+  --nx-values JSON      Precomputed Nx values, one array per run (used by the app).
 
 Examples
 --------
-  # Auto-discover all CSVs in the current directory
-  python generate_report.py
+  # Two MinKNOW run folders, labelled by flow cell
+  generate-ont-report.py /data/run1 /data/run2 -l PBC87221=Liver PBE26402=Blood
 
-  # Explicit files with custom labels
-  python generate_report.py \\
-      --pore-activity pore_activity_PBC87221_*.csv pore_activity_PBE26402_*.csv \\
-      --throughput    throughput_PBC87221_*.csv    throughput_PBE26402_*.csv \\
-      --labels "prom1" "prom2" \\
-      --out my_report.html
+  # All files in the current folder
+  generate-ont-report.py -t "Week 42" -o week42.html
 """
 
 import argparse
-import glob
 import html as html_lib
 import json
 import csv
@@ -237,15 +238,6 @@ def parse_sequencing_summary(path):
 # ---------------------------------------------------------------------------
 # METRICS COMPUTATION
 # ---------------------------------------------------------------------------
-
-def extract_flow_cell_id(pa_path):
-    """Extract the flow cell ID from a pore_activity filename.
-
-    e.g. pore_activity_PBC87221_run1.csv  ->  PBC87221
-    """
-    stem = Path(pa_path).stem.replace("pore_activity_", "")
-    return stem.split("_")[0]
-
 
 def compute_sample_metrics(label, pa_data, tp_data, color, flow_cell_id=""):
     time_map = pa_data["time_to_state_time"]
@@ -1591,69 +1583,157 @@ def _render_table_note():
 
 
 # ---------------------------------------------------------------------------
-# FILE PAIRING
+# INPUT DISCOVERY AND PAIRING
 # ---------------------------------------------------------------------------
 
-def match_pairs(pa_files, tp_files):
-    def run_id(path):
-        stem = Path(path).stem
-        for prefix in ("pore_activity_", "throughput_"):
-            stem = stem.replace(prefix, "")
-        return stem
-
-    pa_by_id = {run_id(f): f for f in pa_files}
-    tp_by_id = {run_id(f): f for f in tp_files}
-    shared = {run_id(f) for f in pa_files} & set(tp_by_id)
-    if shared:
-        # Preserve the original pa_files order so --labels align correctly.
-        return [(pa_by_id[rid], tp_by_id[rid])
-                for rid in (run_id(f) for f in pa_files)
-                if rid in shared]
-    return list(zip(pa_files, tp_files))
+# MinKNOW file kinds; each file is named <kind>_<run id>.<ext>.
+FILE_KINDS = ("pore_activity", "throughput", "sequencing_summary")
+FILE_EXTS = {"pore_activity": ".csv", "throughput": ".csv",
+             "sequencing_summary": (".txt", ".tsv")}
 
 
-def derive_label(pa_path):
-    stem = Path(pa_path).stem.replace("pore_activity_", "")
-    return stem.split("_")[0]
+def _file_kind(path):
+    name = Path(path).name
+    for kind in FILE_KINDS:
+        if name.startswith(kind + "_") and name.endswith(FILE_EXTS[kind]):
+            return kind
+    return None
+
+
+def _run_id(path, kind):
+    stem = Path(path).stem
+    return stem[len(kind) + 1:] if stem.startswith(kind + "_") else stem
+
+
+def discover_inputs(paths):
+    """Expand files and folders (searched recursively) into (kind, path) pairs.
+
+    Returns (items, ignored): items in the order given, folder contents sorted;
+    ignored lists files that aren't MinKNOW pore_activity/throughput/summary files.
+    """
+    items, ignored = [], []
+    for p in map(Path, paths):
+        if p.is_dir():
+            files = sorted(f for f in p.rglob("*") if f.is_file() and _file_kind(f))
+            if not files:
+                print(f"WARNING: no MinKNOW files found in {p}")
+        elif p.is_file():
+            files = [p]
+        else:
+            sys.exit(f"ERROR: {p} does not exist")
+        for f in files:
+            kind = _file_kind(f)
+            if kind:
+                items.append((kind, str(f)))
+            else:
+                ignored.append(str(f))
+    return items, ignored
+
+
+def pair_runs(items):
+    """Group (kind, path) items into runs by run ID.
+
+    Returns (runs, unpaired). Runs keep the order in which their first file
+    was given; each has run_id, pore_activity, throughput and, if found,
+    sequencing_summary. Only renamed files (names not in MinKNOW's
+    <kind>_<run id> form, given via --pore-activity etc.) fall back to
+    pairing in the order given: a MinKNOW-named file whose run ID matches no
+    run belongs to another run and is reported as unpaired, never guessed.
+    """
+    by_run = {}
+    for kind, path in items:
+        entry = by_run.setdefault(_run_id(path, kind), {"run_id": _run_id(path, kind)})
+        if kind in entry:
+            if Path(entry[kind]).resolve() == Path(path).resolve():
+                continue  # same file reached twice (e.g. folder and file)
+            sys.exit(f"ERROR: two {kind} files for run {entry['run_id']}:\n"
+                     f"  {entry[kind]}\n  {path}")
+        entry[kind] = path
+
+    runs = [e for e in by_run.values() if "pore_activity" in e and "throughput" in e]
+    rest = [e for e in by_run.values() if e not in runs]
+    unpaired = [e[k] for e in rest for k in FILE_KINDS if k in e and _file_kind(e[k]) == k]
+    spare = {k: [e[k] for e in rest if k in e and _file_kind(e[k]) != k] for k in FILE_KINDS}
+
+    if spare["pore_activity"] and len(spare["pore_activity"]) == len(spare["throughput"]):
+        print("NOTE: pairing pore_activity and throughput files without a shared run ID "
+              "in the order given.")
+        for pa, tp in zip(spare["pore_activity"], spare["throughput"]):
+            runs.append({"run_id": _run_id(pa, "pore_activity"), "pore_activity": pa, "throughput": tp})
+        spare["pore_activity"], spare["throughput"] = [], []
+
+    # Summaries of complete runs are matched by run ID above; renamed ones only
+    # go to runs without one.
+    lacking = [r for r in runs if "sequencing_summary" not in r]
+    if spare["sequencing_summary"] and len(spare["sequencing_summary"]) == len(lacking):
+        print("NOTE: matching sequencing summaries without a shared run ID in the order given.")
+        for run, ss in zip(lacking, spare["sequencing_summary"]):
+            run["sequencing_summary"] = ss
+        spare["sequencing_summary"] = []
+
+    return runs, unpaired + [f for files in spare.values() for f in files]
+
+
+def assign_labels(runs, labels):
+    """Set run["flow_cell"] and run["label"].
+
+    labels: plain labels apply in run order; NAME=LABEL applies to the run
+    whose run ID or flow cell ID is NAME. Default: the flow cell ID, numbered
+    if a flow cell has several runs.
+    """
+    mapping = dict(l.split("=", 1) for l in labels if "=" in l)
+    ordered = [l for l in labels if "=" not in l]
+    if len(ordered) > len(runs):
+        print(f"WARNING: {len(ordered)} labels given for {len(runs)} runs; extra labels ignored.")
+    flow_cells = [r["run_id"].split("_")[0] for r in runs]
+    used = set()
+    for i, run in enumerate(runs):
+        fc = run["flow_cell"] = flow_cells[i]
+        default = fc if flow_cells.count(fc) == 1 else f"{fc} ({flow_cells[:i + 1].count(fc)})"
+        label = ordered[i] if i < len(ordered) else default
+        for key in (run["run_id"], fc):
+            if key in mapping:
+                label = mapping[key]
+                used.add(key)
+                break
+        run["label"] = label
+    for key in set(mapping) - used:
+        print(f"WARNING: label {key}={mapping[key]} matches no run or flow cell ID.")
 
 
 # ---------------------------------------------------------------------------
 # MAIN GENERATION FUNCTION
 # ---------------------------------------------------------------------------
 
-def generate_report(
-        pa_files, tp_files, labels, title, out_path, sample_hz,
-        sequencing_summary_files=None, nx_values=None):
-    pairs = match_pairs(pa_files, tp_files)
-    if not pairs:
+def generate_report(runs, title, out_path, sample_hz, nx_values=None):
+    """runs: from pair_runs() with labels from assign_labels()."""
+    if not runs:
         sys.exit("ERROR: No matching pore_activity/throughput file pairs found.")
-    if (sequencing_summary_files is not None
-            and len(sequencing_summary_files) != len(pairs)):
-        sys.exit(
-            "ERROR: Provide one sequencing summary file per matched sample, "
-            "in the same order."
-        )
-    if sequencing_summary_files is not None and nx_values is not None:
-        sys.exit("ERROR: Use either sequencing summary files or precomputed Nx values.")
+    summaries = [r.get("sequencing_summary") for r in runs]
+    use_summaries = nx_values is None and all(summaries)
+    if nx_values is None and any(summaries) and not all(summaries):
+        missing = ", ".join(r["label"] for r in runs if not r.get("sequencing_summary"))
+        print(f"WARNING: Nx plot skipped: no sequencing summary for {missing}.")
 
-    print(f"Found {len(pairs)} sample pair(s).")
+    print(f"Found {len(runs)} run(s):")
 
     samples_metrics = []
     tp_data_list = []
 
-    for i, (pa_path, tp_path) in enumerate(pairs):
-        label = labels[i] if i < len(labels) else derive_label(pa_path)
+    for i, run in enumerate(runs):
+        label = run["label"]
         color = SAMPLE_COLORS[i % len(SAMPLE_COLORS)]
-        flow_cell_id = extract_flow_cell_id(pa_path)
-        print(f"  [{i+1}] {label}")
-        print(f"       pore_activity : {pa_path}")
-        print(f"       throughput    : {tp_path}")
+        print(f"  [{i+1}] {label}" + (f"  (run {run['run_id']})" if label != run["run_id"] else ""))
+        print(f"       pore_activity      : {run['pore_activity']}")
+        print(f"       throughput         : {run['throughput']}")
+        if run.get("sequencing_summary"):
+            print(f"       sequencing_summary : {run['sequencing_summary']}")
 
-        pa_data = parse_pore_activity(pa_path)
-        tp_data = parse_throughput(tp_path)
+        pa_data = parse_pore_activity(run["pore_activity"])
+        tp_data = parse_throughput(run["throughput"])
         tp_data_list.append(tp_data)
 
-        metrics = compute_sample_metrics(label, pa_data, tp_data, color, flow_cell_id)
+        metrics = compute_sample_metrics(label, pa_data, tp_data, color, run["flow_cell"])
         samples_metrics.append(metrics)
 
     # Build JSON payloads
@@ -1666,12 +1746,12 @@ def generate_report(
             nx_data = build_nx_plot_data_from_values(samples_metrics, nx_values)
         except ValueError as exc:
             sys.exit(f"ERROR: Invalid precomputed Nx values: {exc}")
-    elif sequencing_summary_files is not None:
+    elif use_summaries:
         try:
-            nx_data = build_nx_plot_data(samples_metrics, sequencing_summary_files)
+            nx_data = build_nx_plot_data(samples_metrics, summaries)
         except (OSError, ValueError) as exc:
             sys.exit(f"ERROR: Unable to read sequencing summary: {exc}")
-    if nx_values is not None or sequencing_summary_files is not None:
+    if nx_values is not None or use_summaries:
         nx_iframe = _render_nx_iframe(nx_data, 440)
         nx_section = (
             "<h3>Read Length Nx</h3>\n"
@@ -1719,52 +1799,52 @@ def generate_report(
 
 def main():
     parser = argparse.ArgumentParser(
+        usage="%(prog)s [INPUT ...] [-o OUT] [-t TITLE] [-l LABEL ...]",
         description="Generate an interactive ONT sequencing HTML report.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--pore-activity", nargs="+", metavar="FILE",
-                        help="pore_activity_*.csv files (auto-discovered if omitted)")
-    parser.add_argument("--throughput", nargs="+", metavar="FILE",
-                        help="throughput_*.csv files (auto-discovered if omitted)")
-    parser.add_argument("--sequencing-summary", nargs="+", metavar="FILE",
-                        help="Optional sequencing_summary.txt/TSV files, one per sample")
-    parser.add_argument("--nx-values", metavar="JSON",
-                        help="Precomputed Nx data as JSON, one array of {x,y} points per sample")
-    parser.add_argument("--labels", nargs="+", metavar="LABEL",
-                        help="Human-readable sample labels (must match file order)")
-    parser.add_argument("--title", default="ONT Sequencing Report",
-                        help="Report title (default: 'ONT Sequencing Report')")
-    parser.add_argument("--out", default="ont-report.html",
+    parser.add_argument("inputs", nargs="*", metavar="INPUT",
+                        help="MinKNOW files and/or run folders (default: current folder)")
+    parser.add_argument("-o", "--out", default="ont-report.html",
                         help="Output HTML file (default: ont-report.html)")
-    parser.add_argument("--sample-hz", type=int, default=5, metavar="INT",
-                        help="Sampling interval for Active-Pores plot in minutes (default: 5)")
+    parser.add_argument("-t", "--title", default="ONT Sequencing Report",
+                        help="Report title (default: 'ONT Sequencing Report')")
+    parser.add_argument("-l", "--labels", nargs="+", metavar="LABEL", default=[],
+                        help="NAME=LABEL (NAME = flow cell or run ID), or labels in run order")
+    parser.add_argument("--sample-hz", type=int, default=5, metavar="MIN",
+                        help="Sampling interval for the active-pores plot in minutes (default: 5)")
+    explicit = parser.add_argument_group("files of one kind (e.g. renamed files)")
+    explicit.add_argument("--pore-activity", nargs="+", metavar="FILE", default=[])
+    explicit.add_argument("--throughput", nargs="+", metavar="FILE", default=[])
+    explicit.add_argument("--sequencing-summary", nargs="+", metavar="FILE", default=[])
+    parser.add_argument("--nx-values", metavar="JSON",
+                        help="Precomputed Nx values as JSON, one array of {x,y} points per run")
     args = parser.parse_args()
     try:
         nx_values = json.loads(args.nx_values) if args.nx_values else None
     except json.JSONDecodeError as exc:
         parser.error(f"--nx-values must be valid JSON: {exc}")
 
-    pa_files = sorted(args.pore_activity or glob.glob("pore_activity_*.csv"))
-    tp_files = sorted(args.throughput   or glob.glob("throughput_*.csv"))
+    has_explicit = args.pore_activity or args.throughput or args.sequencing_summary
+    items, ignored = discover_inputs(args.inputs or ([] if has_explicit else ["."]))
+    for kind in FILE_KINDS:
+        items += [(kind, f) for f in getattr(args, kind)]
+    if ignored:
+        print("NOTE: ignoring files that aren't MinKNOW pore_activity/throughput/"
+              "sequencing_summary files:\n  " + "\n  ".join(ignored))
 
-    if not pa_files:
-        sys.exit("ERROR: No pore_activity_*.csv files found. "
-                 "Use --pore-activity to specify them explicitly.")
-    if not tp_files:
-        sys.exit("ERROR: No throughput_*.csv files found. "
-                 "Use --throughput to specify them explicitly.")
+    runs, unpaired = pair_runs(items)
+    if unpaired:
+        print("WARNING: these files match no complete run (pore_activity + throughput) "
+              "and are ignored:\n  " + "\n  ".join(unpaired))
+    if not runs:
+        sys.exit("ERROR: No pore_activity/throughput pairs found. Pass MinKNOW run folders "
+                 "or files, e.g.: generate-ont-report.py /data/run1 /data/run2")
+    assign_labels(runs, args.labels)
 
-    generate_report(
-        pa_files=pa_files,
-        tp_files=tp_files,
-        labels=args.labels or [],
-        title=args.title,
-        out_path=args.out,
-        sample_hz=args.sample_hz,
-        sequencing_summary_files=args.sequencing_summary,
-        nx_values=nx_values,
-    )
+    generate_report(runs, title=args.title, out_path=args.out,
+                    sample_hz=args.sample_hz, nx_values=nx_values)
 
 
 if __name__ == "__main__":

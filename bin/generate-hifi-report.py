@@ -227,22 +227,35 @@ def load_all_cells(paths):
             cells.append(rec)
 
     cells.sort(key=lambda r: (r["run_start_dt"] or datetime.min, r["well"]))
+
+    # Labels ("<run date> <well>") name an acquisition in the charts and must be
+    # unique: when two runs share a date, use the full run name instead.
+    short = {}
+    for rec in cells:
+        short.setdefault(rec["label"], set()).add(rec["run_name"])
+    for rec in cells:
+        if len(short[rec["label"]]) > 1:
+            rec["label"] = f"{rec['run_name']} {rec['well']}".strip()
     return cells
 
+
+# Group name for cells without a sample name (never the run name, which
+# would mix runs into the sample grouping).
+NO_SAMPLE = "(no sample name)"
 
 # Color-by grouping modes, in dropdown display order. Key is used internally
 # / in JS; label is the human-readable dropdown option text.
 COLOR_GROUP_MODES = [
     ("sample", "Sample"),
     ("run", "Run"),
-    ("cell", "Flow Cell"),
+    ("cell", "SMRT Cell"),
 ]
 
 
 def _group_value(rec, mode):
     """Value used to group/color a cell for a given color-by mode."""
     if mode == "sample":
-        return rec["sample_name"] or rec["run_name"] or "Unknown"
+        return rec["sample_name"] or NO_SAMPLE
     if mode == "run":
         return rec["run_name"] or "Unknown"
     if mode == "cell":
@@ -283,9 +296,10 @@ METRICS_BY_KEY = {key: (label, dec) for key, _col, label, _fn, dec, _t in MASTER
 # chart columns.
 COLUMNS = [
     {"key": "run_name",    "label": "Run Name", "type": "text", "filter": True},
-    {"key": "cell_id",     "label": "Cell ID",   "type": "text", "filter": True},
+    {"key": "cell_id",     "label": "SMRT Cell", "type": "text", "filter": True, "csv_cols": "SMRT Cell ID"},
     {"key": "acquisition", "label": "Use", "type": "number", "csv_cols": "Acquisition",
-     "dec": 0, "filter": False, "title": "Acquisition number: how many times this SMRT cell has been used"},
+     "dec": 0, "filter": False, "title": "Which use of the SMRT Cell this row is (1 = first use); "
+                                          "each row is one acquisition, i.e. one use of a SMRT Cell in a well of a run."},
     {"key": "sample_name", "label": "Sample",    "type": "text", "filter": True},
     {"key": "well",        "label": "Well",      "type": "text", "filter": False},
 ]
@@ -490,8 +504,8 @@ def render_table_row(rec, max_read_bp):
             cell_content = _acq_dots(val)
             if val is not None:
                 extra = " " + tip_attr(tip_html(f"Use {val}", text=(
-                    f"Acquisition {val} of SMRT cell {_html_escape(rec['cell_id'])}"
-                    + (" (multi-use cell)" if rec["multi_use"] else ""))))
+                    f"Use {val} of SMRT Cell {_html_escape(rec['cell_id'])}"
+                    + (" (multi-use SMRT Cell)" if rec["multi_use"] else ""))))
         elif col["key"] == "read_lengths":
             cell_content = _read_length_chart(rec, max_read_bp)
             class_parts += ["mini", "rl-col"]
@@ -586,7 +600,7 @@ def build_chart_payload(cells):
     for rec in cells:
         records.append({
             "label": rec["label"],
-            "sample": rec["sample_name"] or rec["run_name"],
+            "sample": rec["sample_name"] or NO_SAMPLE,
             "well": rec["well"],
             "run": rec["run_name"],
             "cellId": rec["cell_id"],
@@ -695,21 +709,21 @@ HTML_TEMPLATE = """\
 <body>
 
 <h2>%%TITLE%%</h2>
-<p class="subtitle">%%N_CELLS%% SMRT cell(s) across %%N_RUNS%% run(s) &mdash; generated on %%GENERATED_ON%%</p>
+<p class="subtitle">%%COUNTS%% &mdash; generated on %%GENERATED_ON%%</p>
 
-<h3>Sample Summary</h3>
+<h3>HiFi Yield and Reads per Sample</h3>
 <div class="plot-container">
   <iframe srcdoc="%%SAMPLE_IFRAME%%" height="%%SAMPLE_IFRAME_H%%" frameborder="0" scrolling="no"></iframe>
 </div>
 
 <div class="section-head">
-  <h3>Cell Summary</h3>
+  <h3>Acquisition Summary</h3>
   <button class="btn" onclick="downloadTableCsv('cell-table', 'cells')" data-tip="<div class='tt-text'>Rows hidden by the filters are left out.</div>">Download CSV</button>
 </div>
 <div class="filter-bar">
   <label for="filter-run">Run Name</label>
   <select id="filter-run"><option value="">All</option>%%FILTER_RUN_OPTIONS%%</select>
-  <label for="filter-cell">Cell ID</label>
+  <label for="filter-cell">SMRT Cell</label>
   <select id="filter-cell"><option value="">All</option>%%FILTER_CELL_OPTIONS%%</select>
   <label for="filter-sample">Sample</label>
   <select id="filter-sample"><option value="">All</option>%%FILTER_SAMPLE_OPTIONS%%</select>
@@ -717,7 +731,7 @@ HTML_TEMPLATE = """\
   <select id="color-by-select">
     <option value="sample">Sample</option>
     <option value="run">Run</option>
-    <option value="cell">Flow Cell</option>
+    <option value="cell">SMRT Cell</option>
   </select>
   <span class="row-count" id="row-count"></span>
 </div>
@@ -731,7 +745,7 @@ HTML_TEMPLATE = """\
   </tfoot>
 </table>
 </div>
-<p class="table-note">%%TABLE_LEGEND%%</p>
+<p class="table-note">%%TABLE_LEGEND%%<br>Each row is one acquisition: one use of a SMRT Cell, in a well of a run. Subtotals and the Total row count only the acquisitions shown by the filters.</p>
 <script>
 %%TABLE_CSV_JS%%
 
@@ -787,17 +801,17 @@ HTML_TEMPLATE = """\
     document.querySelectorAll('#cell-table tbody.run-group').forEach(tbody => {
       const rows = visibleCellRows(tbody);
       const subtotal = tbody.querySelector('tr.subtotal');
-      // A subtotal of one cell repeats that cell, so only show it for two or more.
+      // A subtotal of one acquisition repeats its row, so only show it for two or more.
       subtotal.style.display = rows.length > 1 ? '' : 'none';
       subtotal.querySelector('.sum-label').innerHTML =
-        `Subtotal <span class="sub">${rows.length} cells</span>`;
+        `Subtotal <span class="sub">${rows.length} acquisitions</span>`;
       fillSums(subtotal, rows);
     });
     const all = visibleCellRows(document.getElementById('cell-table'));
     const total = document.querySelector('#cell-table tr.total-row');
     fillSums(total, all);
     total.querySelector('.sum-label').innerHTML =
-      `<strong>Total</strong> <span class="sub">${all.length} cell${all.length === 1 ? '' : 's'}</span>`;
+      `<strong>Total</strong> <span class="sub">${all.length} acquisition${all.length === 1 ? '' : 's'}</span>`;
   }
 
   function applyFilters() {
@@ -813,7 +827,7 @@ HTML_TEMPLATE = """\
       r.style.display = match ? '' : 'none';
       if (match) shown++;
     });
-    document.getElementById('row-count').textContent = `Showing ${shown} of ${rows.length} cell(s)`;
+    document.getElementById('row-count').textContent = `Showing ${shown} of ${rows.length} acquisitions`;
     updateSums();
     applyDataBars();
   }
@@ -898,7 +912,7 @@ HTML_TEMPLATE = """\
   applyFilters();
 </script>
 
-<h3>Metric by Cell</h3>
+<h3>Metric by Acquisition</h3>
 <div class="plot-container">
   <iframe srcdoc="%%BAR_IFRAME%%" height="600" frameborder="0" scrolling="no"></iframe>
 </div>
@@ -938,7 +952,7 @@ _IFRAME_EXTRA = """\
   <script>
     window.MAX_CHART_W = 1020;
 
-    // Group legend (by sample / run / flow cell): right of the plot when there
+    // Group legend (by sample / run / SMRT Cell): right of the plot when there
     // is room, else in rows below. Click hides a group; build() redraws.
     function groupLegendLayout(totalW, n) {
       if (totalW >= NARROW) return {right: 160, below: false, cols: 1, height: 0};
@@ -980,32 +994,72 @@ _IFRAME_EXTRA = """\
       });
     }
 
+    // Bar labels for acquisitions: the well, then "SMRT Cell · use N"; under
+    // each run's bars a bracket with the run name. Falls back to one rotated
+    // line per bar when bars are too narrow for two flat lines.
+    function drawAcquisitionAxis(svg, data, x, H) {
+      const g = svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`);
+      const mid = d => x(d.label) + x.bandwidth() / 2;
+      const use = d => d.metrics.acquisition_no ? ` · use ${d.metrics.acquisition_no}` : '';
+      if (x.step() >= 84) {
+        data.forEach(d => {
+          const t = g.append('text').attr('text-anchor', 'middle').attr('y', 16);
+          t.append('tspan').attr('x', mid(d)).style('font-weight', '600').text(d.well || d.label);
+          t.append('tspan').attr('x', mid(d)).attr('dy', '1.25em').style('font-size', '10.5px')
+           .style('fill', '#718096').text(`${d.cellId}${use(d)}`);
+        });
+      } else {
+        data.forEach(d => {
+          g.append('text').attr('transform', `translate(${mid(d)},10) rotate(-60)`)
+           .attr('text-anchor', 'end').style('font-size', '10.5px')
+           .text(`${d.well} · ${d.cellId}${use(d)}`);
+        });
+      }
+      // Runs: consecutive bars of the same run share a bracket.
+      const runs = [];
+      data.forEach(d => {
+        const last = runs[runs.length - 1];
+        if (last && last.run === d.run) last.items.push(d);
+        else runs.push({run: d.run, items: [d]});
+      });
+      // Brackets go just below the bar labels, however far those reach.
+      const by = g.node().getBBox().y + g.node().getBBox().height + 10;
+      runs.forEach(({run, items}) => {
+        const x0 = x(items[0].label), x1 = x(items[items.length - 1].label) + x.bandwidth();
+        g.append('path').attr('d', `M${x0},${by - 5}V${by}H${x1}V${by - 5}`)
+         .attr('fill', 'none').attr('stroke', '#a0aec0');
+        g.append('text').attr('x', (x0 + x1) / 2).attr('y', by + 15).attr('text-anchor', 'middle')
+         .style('fill', '#4a5568').text(run || 'Unknown run');
+      });
+      return by + 22;   // height used below the plot
+    }
+
     function fillSelect(sel, options) {
       sel.selectAll('option').data(options).join('option')
          .attr('value', d => d.key).text(d => d.label);
     }
 
-    // Tooltip for one SMRT cell: highlighted value rows first, then identity.
+    // Tooltip for one acquisition: highlighted value rows first, then identity.
     function cellTip(d, valueRows) {
       return tipHtml(escTip(d.label), [
         ...valueRows,
         [null, 'Sample', escTip(d.sample)],
         [null, 'Run', escTip(d.run)],
-        [null, 'Cell ID', `${escTip(d.cellId)}${d.metrics.acquisition_no > 1 ? ` (use ${d.metrics.acquisition_no})` : ''}`],
+        [null, 'SMRT Cell', `${escTip(d.cellId)}${d.metrics.acquisition_no ? ` (use ${d.metrics.acquisition_no})` : ''}`],
       ]);
     }
   </script>"""
 
 
 # ---------------------------------------------------------------------------
-# IFRAME 1: BAR CHART -- dropdown selects which metric to plot per cell
+# IFRAME 1: BAR CHART -- dropdown selects which metric to plot per acquisition
 # ---------------------------------------------------------------------------
 
 BAR_CHART_IFRAME = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <title>Metric by Cell</title>
+  <title>Metric by Acquisition</title>
 %%CHART_HEAD%%
 %%IFRAME_EXTRA%%
 </head>
@@ -1045,10 +1099,10 @@ BAR_CHART_IFRAME = """\
 
       const totalW = chartWidth();
       const legend = groupLegendLayout(totalW, (groups[colorMode] || []).length);
-      const margin = {top: 20, right: legend.right, bottom: 70, left: 70};
+      const margin = {top: 20, right: legend.right, bottom: 84, left: 70};
       const W = totalW - margin.left - margin.right;
-      const H = 460 - margin.top - margin.bottom;
-      const svg = appendSvg(totalW, margin, H, legend, 76);
+      const H = 360;
+      const svg = appendSvg(totalW, margin, H, legend, 92);
 
       const data = records.filter(r => r.metrics[metricKey] !== null &&
                                        r.metrics[metricKey] !== undefined &&
@@ -1060,9 +1114,9 @@ BAR_CHART_IFRAME = """\
 
       svg.append('g').attr('class', 'grid').call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
       svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
-         .call(d3.axisBottom(x))
-         .selectAll('text').attr('transform', 'rotate(-30)').style('text-anchor', 'end');
+         .call(d3.axisBottom(x).tickFormat(''));
       svg.append('g').attr('class', 'axis').call(d3.axisLeft(y).tickFormat(d3.format(',.2~f')));
+      const axisH = drawAcquisitionAxis(svg, data, x, H);
       axisLabel(svg, meta.label || metricKey, {transform: 'rotate(-90)', x: -H / 2, y: -55});
 
       const decimals = meta.decimals ?? 2;
@@ -1078,7 +1132,10 @@ BAR_CHART_IFRAME = """\
           [d.colors[colorMode], meta.label, d3.format(',.' + decimals + 'f')(d.metrics[metricKey])]])))
         .on('mouseout', hideTooltip);
 
-      drawGroupLegend(svg, W, H, legend, 76, 'rect');
+      drawGroupLegend(svg, W, H, legend, axisH + 4, 'rect');
+      // Size the chart to the labels actually drawn (rotated ones need more room).
+      d3.select(svg.node().ownerSVGElement)
+        .attr('height', margin.top + H + axisH + (legend.below ? legend.height + 4 : 0));
       fitFrame();
     }
 
@@ -1216,7 +1273,7 @@ SCATTER_IFRAME = """\
 
 
 # ---------------------------------------------------------------------------
-# IFRAME 3: SAMPLE SUMMARY -- HiFi yield per sample, one segment per cell
+# IFRAME 3: SAMPLE SUMMARY -- HiFi yield and reads per sample, one segment per acquisition
 # ---------------------------------------------------------------------------
 
 SAMPLE_IFRAME = """\
@@ -1226,10 +1283,16 @@ SAMPLE_IFRAME = """\
   <title>HiFi Yield and Reads per Sample</title>
 %%CHART_HEAD%%
 %%IFRAME_EXTRA%%
+  <style>
+    .export-bar{position:static;justify-content:flex-end;margin-bottom:2px;}
+    #chart-container{max-width:none;}   /* use the section's full width */
+  </style>
+  <script>window.MAX_CHART_W = 4000;</script>
 </head>
 <body>
   <div id="chart-container">
-    <h2 id="chart-title">HiFi Yield and Reads per Sample</h2>
+    <!-- The section heading names this chart; the hidden title is used for exports. -->
+    <h2 id="chart-title" style="display:none">HiFi Yield and Reads per Sample</h2>
 %%EXPORT_BUTTONS%%
     <div id="chart"></div>
     <div class="tooltip" id="tooltip"></div>
@@ -1247,8 +1310,8 @@ SAMPLE_IFRAME = """\
        fmt: fmtReads, tipFmt: v => Math.round(v).toLocaleString()},
     ];
 
-    // One bar per sample and panel; each SMRT cell (acquisition) is a
-    // segment, in run order, with its [x0, x1] per panel.
+    // One bar per sample and panel; each acquisition (one use of a SMRT
+    // Cell) is a segment, in run order, with its [x0, x1] per panel.
     const samples = [];
     const bySample = new Map();
     payload.records.forEach(r => {
@@ -1283,7 +1346,7 @@ SAMPLE_IFRAME = """\
       d3.select('#chart').selectAll('*').remove();
       const totalW = chartWidth();
       const narrow = totalW < NARROW;   // panels stacked instead of side by side
-      const labelW = 96, gap = 44, valueW = 74, titleH = 22, axisH = 30;
+      const labelW = 136, gap = 44, valueW = 74, titleH = 22, axisH = 30;
       const H = samples.length * 36;
       const blockH = titleH + H + axisH;
       const panelW = narrow ? totalW - labelW : (totalW - labelW - gap) / 2;
@@ -1308,16 +1371,17 @@ SAMPLE_IFRAME = """\
         g.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
          .call(d3.axisBottom(x).ticks(ticks).tickFormat(panel.key === 'q20_reads' ? d3.format('.2~s') : null));
 
-        // Sample names (and cell counts) once per row of panels.
+        // Sample names (and acquisition counts) once per row of panels.
         if (pi === 0 || narrow) {
           samples.forEach(s => {
             const n = s.cells.length;
+            const smrt = new Set(s.cells.map(c => c.r.cellId)).size;
             const t = g.append('text').attr('x', -10).attr('text-anchor', 'end')
               .attr('y', y(s.name) + y.bandwidth() / 2).style('font-size', '12px').style('fill', '#333');
             t.append('tspan').attr('dy', '-0.1em').text(s.name);
             t.append('tspan').attr('x', -10).attr('dy', '1.15em')
              .style('font-size', '10.5px').style('fill', '#718096')
-             .text(`${n} cell${n === 1 ? '' : 's'}`);
+             .text(`${n} acq. · ${smrt} SMRT Cell${smrt === 1 ? '' : 's'}`);
           });
         }
 
@@ -1329,7 +1393,7 @@ SAMPLE_IFRAME = """\
             .attr('y', y(s.name))
             .attr('width', d => Math.max(0, x(d.seg[panel.key][1]) - x(d.seg[panel.key][0])))
             .attr('height', y.bandwidth())
-            // Alternate shades so neighbouring cells stay distinguishable.
+            // Alternate shades so neighbouring acquisitions stay distinguishable.
             .attr('fill', (d, i) => i % 2 ? d3.color(s.color).brighter(0.55) : s.color)
             .attr('stroke', '#fff').attr('stroke-width', 1)
             .on('mousemove', (event, d) => showTooltip(event, segmentTip(s, d, panel)))
@@ -1455,18 +1519,26 @@ def _render_iframe(template, payload, title):
 def generate_report(files, title, out_path):
     cells = load_all_cells(files)
     if not cells:
-        sys.exit("ERROR: No cell rows found in the given file(s).")
+        sys.exit("ERROR: No SMRT Cell rows found in the given file(s).")
 
     assign_colors(cells)
 
     n_runs = len({c["run_id"] or c["run_name"] for c in cells})
-    print(f"Loaded {len(cells)} SMRT cell(s) across {n_runs} run(s) from {len(files)} file(s).")
+    n_smrt = len({c["cell_id"] for c in cells if c["cell_id"]})
+    n_samp = len({c["sample_name"] or NO_SAMPLE for c in cells})
+    def plural(n, word):
+        return f"{n} {word}{'' if n == 1 else 's'}"
+    # A row is an acquisition: one use of a SMRT Cell (a well in a run).
+    counts = (f"{plural(len(cells), 'acquisition')} of {plural(n_smrt, 'SMRT Cell')} "
+              f"&middot; {plural(n_samp, 'sample')} &middot; {plural(n_runs, 'run')}")
+    print(f"Loaded {plural(len(cells), 'acquisition')} of {plural(n_smrt, 'SMRT Cell')} "
+          f"({plural(n_samp, 'sample')}, {plural(n_runs, 'run')}) from {plural(len(files), 'file')}.")
 
     payload = build_chart_payload(cells)
-    bar_iframe = _render_iframe(BAR_CHART_IFRAME, payload, "Metric by Cell")
+    bar_iframe = _render_iframe(BAR_CHART_IFRAME, payload, "Metric by Acquisition")
     scatter_iframe = _render_iframe(SCATTER_IFRAME, payload, "Metric Correlation")
     sample_iframe = _render_iframe(SAMPLE_IFRAME, payload, "HiFi Yield and Reads per Sample")
-    n_samples = len({rec["sample_name"] or rec["run_name"] for rec in cells})
+    n_samples = len({rec["sample_name"] or NO_SAMPLE for rec in cells})
 
     # The multi-use chart only appears when some cell was acquired more than once.
     cell_uses = {}
@@ -1487,7 +1559,7 @@ def generate_report(files, title, out_path):
         HTML_TEMPLATE,
         title=title,
         table_csv_js=TABLE_CSV_JS,
-        n_cells=len(cells),
+        counts=counts,
         n_runs=n_runs,
         table_header=render_table_header(),
         table_bodies=render_table_body(cells),
