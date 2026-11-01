@@ -42,6 +42,7 @@ Examples
 import argparse
 import csv
 import glob
+import math
 import re
 import sys
 from datetime import datetime
@@ -76,9 +77,11 @@ def _float(v):
     if v is None:
         return None
     try:
-        return float(v.replace(",", ""))
+        f = float(v.replace(",", ""))
     except ValueError:
         return None
+    # "nan"/"inf" parse as floats but mean the value is missing.
+    return f if math.isfinite(f) else None
 
 
 def _int(v):
@@ -260,9 +263,9 @@ DEMUX_NAME_RE = re.compile(
     r"(?P<movie>m(?P<inst>\w+?)_(?P<date>\d{6})_(?P<time>\d{6})_s\d+)\.barcodes\.summary", re.I)
 # Run IDs look like "r84180_20261021_131658".
 RUN_ID_RE = re.compile(r"^r\w+?_(\d{8})_(\d{6})$")
-# A movie starts after its run does; allow time-zone slack before and a long
-# run (several cells in sequence) after.
-MOVIE_WINDOW_DAYS = (-1, 10)
+# A movie starts after its run does; allow time-zone slack before and a run
+# with several cells in sequence after.
+MOVIE_WINDOW_DAYS = (-1, 3)
 # Warn when the barcodes' summed yield is this far off the matched cell's.
 YIELD_MISMATCH = 0.05
 # Barcode rows that are not a sample (reads with no barcode found).
@@ -625,7 +628,7 @@ def _csv_values(rec, keys):
 def render_table_header():
     ths = []
     for col in COLUMNS:
-        attrs = [f'data-type="{col["type"]}"', 'onclick="sortTable(this)"']
+        attrs = [f'data-type="{col["type"]}"', f'data-key="{col["key"]}"', 'onclick="sortTable(this)"']
         if col["type"] == "number":
             attrs.append('style="text-align:right"')
         if col.get("bar"):
@@ -636,6 +639,10 @@ def render_table_header():
             attrs.append(tip_attr(tip_html(_html_escape(col["label"]), text=_html_escape(col["title"]))))
         ths.append(f'<th {" ".join(attrs)}>{col["label"]}<span class="sort-arrow"></span></th>')
     return "".join(ths)
+
+
+# Text columns holding a "Color by" group, by mode.
+TAG_KEYS = {"run_name": "run", "cell_id": "cell", "sample_name": "sample"}
 
 
 def render_table_row(rec, max_read_bp):
@@ -673,6 +680,9 @@ def render_table_row(rec, max_read_bp):
             class_parts.append("mini")
             extra = (f' data-csv="{_csv_values(rec, [k for k, _l, _c in LOADING_PARTS])}" '
                      + tip_attr(_loading_tip(rec)))
+        elif col["key"] in TAG_KEYS:
+            # Tagged so the page can colour the column chosen in "Color by".
+            cell_content = f'<span class="tag">{_html_escape(_col_display(rec, col))}</span>'
         else:
             cell_content = _html_escape(_col_display(rec, col))
         style_attr = f' style="{";".join(style_parts)}"' if style_parts else ""
@@ -802,13 +812,29 @@ def render_demux_header():
     return "".join(ths)
 
 
+# "Color by" in the demux table and chart: the acquisition's groups, as in
+# the Acquisition Summary.
+DEMUX_COLOR_MODES = COLOR_GROUP_MODES
+UNMATCHED_COLOR = "#cbd5e0"
+
+
+def demux_colors(demuxes):
+    """Set r["colors"] / r["names"] {mode: ...} on every barcode row."""
+    for d in demuxes:
+        for r in d["rows"]:
+            r["colors"] = {mode: d["cell"]["colors"][mode] if d["cell"] else UNMATCHED_COLOR
+                           for mode, _label in DEMUX_COLOR_MODES}
+            r["names"] = {mode: _group_value(d["cell"], mode) if d["cell"] else "(unmatched)"
+                          for mode, _label in DEMUX_COLOR_MODES}
+
+
 def render_demux_bodies(demuxes):
-    maxes = {key: max((r[key] or 0 for d in demuxes for r in d["rows"]), default=0)
-             for key, _l, _d, bar, _c in DEMUX_COLUMNS if bar}
     bodies = []
     for d in demuxes:
+        # Data bars are scaled per acquisition, to show how evenly it split.
+        maxes = {key: max((r[key] or 0 for r in d["rows"]), default=0)
+                 for key, _l, _d, bar, _c in DEMUX_COLUMNS if bar}
         ident = _demux_ident(d)
-        color = d["cell"]["colors"]["sample"] if d["cell"] else "#cbd5e0"
         rows = []
         acq_csv = _html_escape("|".join(ident[k] for k in ("run_name", "well", "cell_id")))
         acq_tip = tip_attr(tip_html(_html_escape(_demux_label(d)), [
@@ -825,10 +851,14 @@ def render_demux_bodies(demuxes):
                 cls = extra = ""
                 if key == "acq":
                     cls = ' class="color-stripe"'
-                    styles.append(f"box-shadow:inset 4px 0 0 {color},inset -1px 0 0 #e2e8f0")
+                    styles.append(f"box-shadow:inset 4px 0 0 {r['colors']['sample']},inset -1px 0 0 #e2e8f0")
                     extra = f' data-csv="{acq_csv}" {acq_tip}'
-                    sub = " &middot; ".join(_html_escape(v) for v in (ident["sample"], ident["cell_id"]) if v)
-                    content = f'{_html_escape(_demux_label(d))}<div class="acq-sub">{sub}</div>'
+                    # Tagged parts are coloured by the matching "Color by" mode.
+                    sub = " &middot; ".join(f'<span class="tag" data-tag="{mode}">{_html_escape(v)}</span>'
+                                            for mode, v in (("sample", ident["sample"]), ("cell", ident["cell_id"]))
+                                            if v)
+                    content = (f'<span class="tag" data-tag="run">{_html_escape(_demux_label(d))}</span>'
+                               f'<div class="acq-sub">{sub}</div>')
                     style = f' style="{";".join(styles)}"'
                     tds.append(f'<td{cls}{style}{extra}>{content}</td>')
                     continue
@@ -846,7 +876,9 @@ def render_demux_bodies(demuxes):
                 style = f' style="{";".join(styles)}"' if styles else ""
                 tds.append(f'<td{cls}{style} data-value="{data_value}"{extra}>{content}</td>')
             row_cls = "demux-row" + ("" if r["barcoded"] else " unbarcoded")
-            rows.append(f'    <tr class="{row_cls}">' + "".join(tds) + "</tr>")
+            mode_attrs = "".join(f' data-color-{m}="{r["colors"][m]}" data-name-{m}="{_html_escape(r["names"][m])}"'
+                                 for m, _l in DEMUX_COLOR_MODES)
+            rows.append(f'    <tr class="{row_cls}"{mode_attrs}>' + "".join(tds) + "</tr>")
 
         n_bc = sum(r["barcoded"] for r in d["rows"])
         cv = barcode_cv(d["rows"])
@@ -875,9 +907,8 @@ def build_demux_payload(demuxes):
         groups.append({
             "label": _demux_label(d), "run": ident["run_name"], "well": ident["well"],
             "cellId": ident["cell_id"], "sample": ident["sample"],
-            "color": d["cell"]["colors"]["sample"] if d["cell"] else "#94a3b8",
             "rows": [{"name": r["bio_sample"] or r["barcode"], "barcode": r["barcode"],
-                      "barcoded": r["barcoded"],
+                      "barcoded": r["barcoded"], "colors": r["colors"],
                       "metrics": {k: r[k] for k in ("reads", "reads_pct", "yield_gb",
                                                     "mean_len", "qv", "bc_quality")}}
                      for r in d["rows"]],
@@ -896,7 +927,9 @@ def build_demux_payload(demuxes):
 def render_demux_section(demuxes):
     if not demuxes:
         return ""
+    demux_colors(demuxes)
     n_rows = sum(len(d["rows"]) for d in demuxes)
+    options = "".join(f'<option value="{m}">{label}</option>' for m, label in DEMUX_COLOR_MODES)
     iframe = _render_iframe(DEMUX_IFRAME, build_demux_payload(demuxes), "Demultiplexing")
     n_unmatched = sum(d["cell"] is None for d in demuxes)
     unmatched = (f" {n_unmatched} file{'' if n_unmatched == 1 else 's'} could not be matched to an "
@@ -907,6 +940,11 @@ def render_demux_section(demuxes):
   <h3>Demultiplexing</h3>
   <button class="btn" onclick="downloadTableCsv('demux-table', 'demux')">Download CSV</button>
 </div>
+<div class="filter-bar">
+  <label for="demux-color-by">Color by</label>
+  <select id="demux-color-by">{options}</select>
+</div>
+<div id="demux-legend" class="color-legend"></div>
 <div class="table-wrap">
 <table id="demux-table">
   <thead><tr>{render_demux_header()}</tr></thead>
@@ -916,8 +954,42 @@ def render_demux_section(demuxes):
 <p class="table-note">One row per barcode, grouped by acquisition; barcode files are matched to
 acquisitions by instrument, movie date and sample name in the file name, then by HiFi yield.{unmatched}</p>
 <div class="plot-container">
-  <iframe srcdoc="{iframe}" height="{150 + 24 * n_rows + 34 * len(demuxes)}" frameborder="0" scrolling="no"></iframe>
+  <iframe id="demux-chart" srcdoc="{iframe}" height="{150 + 24 * n_rows + 60 * len(demuxes)}" frameborder="0" scrolling="no"></iframe>
 </div>
+<script>
+  // Stripe, tinted tag and legend for the "Color by" mode; the chart follows.
+  function applyDemuxColors(mode) {{
+    const attr = 'color' + mode[0].toUpperCase() + mode.slice(1);
+    const nameAttr = 'name' + mode[0].toUpperCase() + mode.slice(1);
+    const seen = new Map();
+    document.querySelectorAll('#demux-table tr.demux-row').forEach(r => {{
+      const color = r.dataset[attr];
+      r.querySelector('td.color-stripe').style.boxShadow = `inset 4px 0 0 ${{color}},inset -1px 0 0 #e2e8f0`;
+      r.querySelectorAll('.tag').forEach(t => {{
+        const on = t.dataset.tag === mode;
+        t.classList.toggle('on', on);
+        t.style.background = on ? `color-mix(in srgb, ${{color}} 16%, transparent)` : '';
+        t.style.color = on ? `color-mix(in srgb, ${{color}} 75%, #000)` : '';
+      }});
+      if (!seen.has(r.dataset[nameAttr])) seen.set(r.dataset[nameAttr], color);
+    }});
+    const legend = document.getElementById('demux-legend');
+    legend.innerHTML = '';
+    seen.forEach((color, name) => {{
+      const item = document.createElement('div');
+      item.innerHTML = `<span style="background:${{color}}"></span>`;
+      item.append(name);
+      legend.appendChild(item);
+    }});
+    const chart = document.getElementById('demux-chart');
+    try {{ chart.contentWindow.setColorMode && chart.contentWindow.setColorMode(mode); }} catch (e) {{}}
+  }}
+  const demuxColorBy = document.getElementById('demux-color-by');
+  demuxColorBy.addEventListener('change', () => applyDemuxColors(demuxColorBy.value));
+  applyDemuxColors(demuxColorBy.value);
+  // The chart may load after this runs: give it the current mode once it is up.
+  document.getElementById('demux-chart').addEventListener('load', () => applyDemuxColors(demuxColorBy.value));
+</script>
 """
 
 
@@ -1008,12 +1080,18 @@ HTML_TEMPLATE = """\
      box-shadow:inset -1px 0 0 #e2e8f0;}
   #cell-table tbody td:first-child{background:#fff;}
   #cell-table tr.subtotal td:first-child{background:#f8fafc;}
+  .tag{display:inline-block;padding:1px 7px;margin:-1px -7px;border-radius:4px;}
+  .tag.on{font-weight:600;}
   #demux-table th{cursor:default;}
   #demux-table th:hover{background:#edf2f7;}
   #demux-table th:first-child,#demux-table td:first-child{position:sticky;left:0;z-index:2;}
   #demux-table tbody td:first-child{background:#fff;}
   #demux-table tr.subtotal td:first-child{background:#f8fafc;}
   #demux-table tr.unbarcoded td{color:#94a3b8;}
+  #demux-table .acq-sub .tag{padding:0 5px;margin:0 -5px;}
+  .color-legend{display:flex;flex-wrap:wrap;gap:6px 12px;margin:2px 0 12px;font-size:12px;color:#555;}
+  .color-legend div{display:flex;align-items:center;gap:5px;}
+  .color-legend span{width:10px;height:10px;border-radius:3px;display:inline-block;}
   #demux-table .acq-sub{font-size:11.5px;color:#718096;line-height:1.3;}
   #demux-table tr.unbarcoded .bar-fill{background:#cbd5e0;}
   .table-note{font-size:12px;color:#718096;margin:6px 0 8px;}
@@ -1178,10 +1256,21 @@ HTML_TEMPLATE = """\
   const COLOR_ATTR = { sample: 'colorSample', run: 'colorRun', cell: 'colorCell' };
   const NAME_ATTR  = { sample: 'sample',       run: 'run',       cell: 'cell' };
 
+  const TAG_COL = { sample: 'sample_name', run: 'run_name', cell: 'cell_id' };
+
+  // Stripe plus a tinted tag on the column that names the colour group.
   function applyRowColors(mode) {
+    const ci = HEADER_THS.findIndex(th => th.dataset.key === TAG_COL[mode]);
     document.querySelectorAll('#cell-table ' + CELL_ROWS).forEach(r => {
+      const color = r.dataset[COLOR_ATTR[mode]];
       const stripe = r.querySelector('td.color-stripe');
-      if (stripe) stripe.style.boxShadow = `inset 4px 0 0 ${r.dataset[COLOR_ATTR[mode]]},inset -1px 0 0 #e2e8f0`;
+      if (stripe) stripe.style.boxShadow = `inset 4px 0 0 ${color},inset -1px 0 0 #e2e8f0`;
+      r.querySelectorAll('.tag').forEach(t => {
+        const on = t.parentElement === r.children[ci];
+        t.classList.toggle('on', on);
+        t.style.background = on ? `color-mix(in srgb, ${color} 16%, transparent)` : '';
+        t.style.color = on ? `color-mix(in srgb, ${color} 75%, #000)` : '';
+      });
     });
   }
 
@@ -1881,6 +1970,9 @@ DEMUX_IFRAME = """\
     const metrics = payload.metrics;
     const select = d3.select('#metric-select');
     fillSelect(select, metrics);
+    // Set from the table's "Color by" (see applyDemuxColors in the report).
+    let colorMode = 'sample';
+    window.setColorMode = mode => { if (mode !== colorMode) { colorMode = mode; build(); } };
 
     function build() {
       d3.select('#chart').selectAll('*').remove();
@@ -1890,19 +1982,12 @@ DEMUX_IFRAME = """\
       const fmt = d3.format(',.' + (meta.decimals ?? 2) + 'f');
 
       const totalW = chartWidth();
-      const labelW = Math.min(170, totalW * 0.3), valueW = 70, rowH = 24, headH = 34, axisH = 30;
+      const labelW = Math.min(170, totalW * 0.3), valueW = 70, rowH = 24, headH = 34, axisH = 26;
       const W = Math.max(60, totalW - labelW - valueW);
-      const H = groups.reduce((h, g) => h + headH + g.rows.length * rowH, 0);
-      const svg = d3.select('#chart').append('svg').attr('width', totalW).attr('height', H + axisH)
+      const H = groups.reduce((h, g) => h + headH + g.rows.length * rowH + axisH, 0);
+      const svg = d3.select('#chart').append('svg').attr('width', totalW).attr('height', H)
         .append('g').attr('transform', `translate(${labelW},0)`);
-      const max = d3.max(groups, g => d3.max(g.rows, r => r.metrics[key])) || 1;
-      const x = d3.scaleLinear().domain([0, max * 1.04]).range([0, W]);
       const ticks = Math.max(2, Math.floor(W / 80));
-
-      svg.append('g').attr('class', 'grid').attr('transform', `translate(0,${H})`)
-         .call(d3.axisBottom(x).ticks(ticks).tickSize(-H).tickFormat(''));
-      svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
-         .call(d3.axisBottom(x).ticks(ticks).tickFormat(d3.format('.3~s')));
 
       let oy = 0;
       groups.forEach(g => {
@@ -1911,6 +1996,15 @@ DEMUX_IFRAME = """\
         head.append('tspan').style('font-weight', '600').text(g.label);
         if (g.sample) head.append('tspan').style('fill', '#718096').text(`  ${g.sample} · ${g.cellId}`);
         oy += headH;
+
+        // Each acquisition has its own scale, to show how evenly it split.
+        const gH = g.rows.length * rowH;
+        const max = d3.max(g.rows, r => r.metrics[key]) || 1;
+        const x = d3.scaleLinear().domain([0, max * 1.04]).range([0, W]);
+        svg.append('g').attr('class', 'grid').attr('transform', `translate(0,${oy + gH})`)
+           .call(d3.axisBottom(x).ticks(ticks).tickSize(-gH).tickFormat(''));
+        svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${oy + gH})`)
+           .call(d3.axisBottom(x).ticks(ticks).tickFormat(d3.format('.3~s')));
 
         // Even split: what each barcode would get if reads were spread equally.
         const bc = g.rows.filter(r => r.barcoded && r.metrics[key] != null);
@@ -1930,9 +2024,9 @@ DEMUX_IFRAME = """\
           if (v == null) return;
           svg.append('rect').attr('class', 'bar').attr('x', 0).attr('y', y + 4)
              .attr('width', x(v)).attr('height', rowH - 8).attr('rx', 2)
-             .attr('fill', r.barcoded ? g.color : '#cbd5e0')
+             .attr('fill', r.barcoded ? r.colors[colorMode] : '#cbd5e0')
              .on('mousemove', event => showTooltip(event, tipHtml(escTip(r.name), [
-               [r.barcoded ? g.color : '#cbd5e0', meta.label, fmt(v)],
+               [r.barcoded ? r.colors[colorMode] : '#cbd5e0', meta.label, fmt(v)],
                [null, 'Barcode', escTip(r.barcode)],
                [null, 'Acquisition', escTip(g.label)],
                [null, 'Sample', escTip(g.sample || '-')],
@@ -1942,7 +2036,7 @@ DEMUX_IFRAME = """\
              .attr('y', y + rowH / 2).attr('dy', '0.35em').attr('fill', '#4a5568')
              .text(key === 'reads' && v >= 1e6 ? (v / 1e6).toFixed(2) + ' M' : fmt(v));
         });
-        oy += g.rows.length * rowH;
+        oy += gH + axisH;
       });
       fitFrame();
     }
