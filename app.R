@@ -42,7 +42,7 @@ sidebar <- sidebar(
         tooltip(
           bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
           tags$span("ONT: pore_activity_*.csv + throughput_*.csv, with optional browser-processed sequencing summaries.", tags$br(),
-                    "PacBio HiFi: *run-qc-export*.csv (SMRT Link)."),
+                    "PacBio HiFi: *run-qc-export*.csv (SMRT Link), with optional *.barcodes.summary.csv demultiplexing files."),
           placement = "left"
         )
       ),
@@ -73,9 +73,12 @@ sidebar <- sidebar(
       condition = "input.seq_type == 'hifi'",
       fileInput('hifi_files',
         label = tags$span(
-          "run-qc-export CSV file(s)", class = "small fw-semibold",
+          "run-qc-export and barcodes CSV file(s)", class = "small fw-semibold",
           tooltip(bs_icon("question-circle", class = "text-muted small", style = "margin-left:4px;cursor:pointer;"),
-                  "One or more *run-qc-export*.csv files exported from SMRT Link.", placement = "right")
+                  "One or more *run-qc-export*.csv files exported from SMRT Link.",
+                  "Optionally add *.barcodes.summary.csv files to get a Demultiplexing section;",
+                  "each is matched to its SMRT Cell by the instrument, movie date and sample name in its file name.",
+                  placement = "right")
         ),
         accept = ".csv", buttonLabel = "Browse…",
         placeholder = "Select CSV file(s)", multiple = TRUE

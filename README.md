@@ -57,7 +57,14 @@ Upload one or more `*run-qc-export*.csv` files exported from **SMRT Link** (one 
   loading (P0 / P1 / P2) are shown as small inline charts, and the table
   downloads as CSV;
 - any metric per cell, metric-vs-metric correlation, and — when a SMRT cell
-  was used more than once — a metric across its acquisitions.
+  was used more than once — a metric across its acquisitions;
+- optionally, a **Demultiplexing** section: add SMRT Link
+  `*.barcodes.summary.csv` files to the upload (or pass them with `--demux`)
+  to get reads, yield, read length, QV and barcode quality per barcode, with
+  each barcode's share of the cell's reads and the CV across barcodes. Each
+  file is matched to its acquisition by the instrument, movie date and sample
+  name in its file name (`analysis-<sample>-<job>-m<instrument>_<YYMMDD>_<HHMMSS>_s<N>…`),
+  then by the HiFi yield closest to the barcodes' total.
 
 ---
 

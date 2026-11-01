@@ -14,9 +14,19 @@ Options
 -------
   --title   TEXT   Report title (default: "HiFi Sequencing Report").
   --out     PATH   Output HTML file (default: hifi-report.html).
+  --demux   FILE.. SMRT Link "*.barcodes.summary.csv" demultiplexing file(s);
+                   adds a Demultiplexing section. Such files can also be
+                   passed as FILE arguments (they are recognised by their
+                   columns).
 
 If no FILE arguments are given, the script auto-discovers files matching
-"*qc-export*.csv" in the current directory.
+"*qc-export*.csv" and "*barcodes.summary*.csv" in the current directory.
+
+Each barcodes summary is matched to one acquisition: its file name
+("analysis-<sample>-<job>-m<instrument>_<YYMMDD>_<HHMMSS>_s<N>...") gives the
+instrument, movie date and sample name, which must agree with the run-qc-export
+row; when several rows still fit, the one whose HiFi yield is closest to the
+barcodes' total yield wins.
 
 Examples
 --------
@@ -237,6 +247,153 @@ def load_all_cells(paths):
         if len(short[rec["label"]]) > 1:
             rec["label"] = f"{rec['run_name']} {rec['well']}".strip()
     return cells
+
+
+# ---------------------------------------------------------------------------
+# DEMULTIPLEXING (SMRT Link "*.barcodes.summary.csv", one row per barcode)
+# ---------------------------------------------------------------------------
+
+# SMRT Link names these files "analysis-<sample>-<job id>-<movie>.barcodes.summary.csv",
+# the movie being "m<instrument>_<YYMMDD>_<HHMMSS>_s<N>".
+DEMUX_NAME_RE = re.compile(
+    r"^(?:analysis-)?(?P<sample>.+?)-(?P<job>\d+)-"
+    r"(?P<movie>m(?P<inst>\w+?)_(?P<date>\d{6})_(?P<time>\d{6})_s\d+)\.barcodes\.summary", re.I)
+# Run IDs look like "r84180_20261021_131658".
+RUN_ID_RE = re.compile(r"^r\w+?_(\d{8})_(\d{6})$")
+# A movie starts after its run does; allow time-zone slack before and a long
+# run (several cells in sequence) after.
+MOVIE_WINDOW_DAYS = (-1, 10)
+# Warn when the barcodes' summed yield is this far off the matched cell's.
+YIELD_MISMATCH = 0.05
+# Barcode rows that are not a sample (reads with no barcode found).
+NOT_BARCODED = "Not Barcoded"
+
+
+def is_demux_csv(path):
+    """True for a barcodes summary CSV (as opposed to a run-qc-export)."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            header = next(csv.reader(fh), [])
+    except OSError:
+        return False
+    return "Barcode" in header and "HiFi Reads" in header
+
+
+def _norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def load_demux(path):
+    name = Path(path).name
+    rows = []
+    for raw in parse_qc_csv(path):
+        barcode = (raw.get("Barcode") or "").strip()
+        yield_bp = _float(raw.get("HiFi Yield (bp)"))
+        rows.append({
+            "bio_sample": (raw.get("Sample Name") or "").strip(),
+            "barcode":    barcode,
+            "barcoded":   barcode.lower() != NOT_BARCODED.lower(),
+            "bc_quality": _float(raw.get("Barcode Quality")),
+            "reads":      _int(raw.get("HiFi Reads")),
+            "mean_len":   _int(raw.get("HiFi Read Length (mean, bp)")),
+            "qv":         _q_value(raw.get("HiFi Read Quality (median, QV)")),
+            "yield_gb":   round(yield_bp / 1e9, 3) if yield_bp is not None else None,
+        })
+    # Barcoded samples first (in file order), then the unbarcoded reads.
+    rows.sort(key=lambda r: not r["barcoded"])
+    total_reads = sum(r["reads"] or 0 for r in rows)
+    for r in rows:
+        r["reads_pct"] = round(100 * (r["reads"] or 0) / total_reads, 2) if total_reads else None
+
+    m = DEMUX_NAME_RE.match(name)
+    info = m.groupdict() if m else {}
+    movie_dt = None
+    if m:
+        try:
+            movie_dt = datetime.strptime(info["date"] + info["time"], "%y%m%d%H%M%S")
+        except ValueError:
+            pass
+    return {"file": name, "rows": rows, "cell": None,
+            "movie": info.get("movie", ""), "instrument": info.get("inst", ""),
+            "sample_hint": info.get("sample", ""), "movie_dt": movie_dt,
+            "yield_gb": sum(r["yield_gb"] or 0 for r in rows)}
+
+
+def _run_dt(rec):
+    """Run start from the Run ID (instrument clock, like the movie name)."""
+    m = RUN_ID_RE.match(rec["run_id"])
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    return rec["run_start_dt"]
+
+
+def match_demux(demux, cells):
+    """Pick the acquisition a barcodes summary belongs to.
+
+    Instrument and movie date (from the file name) must agree with the run;
+    among those, cells whose sample name is in the file name are preferred,
+    and the cell with the closest HiFi yield to the barcodes' total wins.
+    Without a parsable file name all cells are candidates.
+    """
+    cands = list(cells)
+    if demux["instrument"]:
+        cands = [c for c in cands if not c["instrument_sn"] or c["instrument_sn"] == demux["instrument"]]
+    if demux["movie_dt"]:
+        lo, hi = MOVIE_WINDOW_DAYS
+        def in_window(c):
+            dt = _run_dt(c)
+            return dt is None or lo <= (demux["movie_dt"] - dt).total_seconds() / 86400 <= hi
+        cands = [c for c in cands if in_window(c)]
+    hint = _norm_name(demux["sample_hint"] or demux["file"])
+    named = [c for c in cands if c["sample_name"] and _norm_name(c["sample_name"]) in hint]
+    cands = named or cands
+    if not cands:
+        return None
+
+    def yield_gap(c):
+        y = c["metrics"].get("hifi_yield_gb")
+        return abs(y - demux["yield_gb"]) / max(y, 1e-9) if y else float("inf")
+    best = min(cands, key=yield_gap)
+    # With nothing but yield to go on, a poor yield match is no match.
+    if not named and not (demux["instrument"] or demux["movie_dt"]) and yield_gap(best) > YIELD_MISMATCH:
+        return None
+    if yield_gap(best) > YIELD_MISMATCH:
+        print(f"WARNING: {demux['file']}: barcode yield {demux['yield_gb']:.2f} Gb differs from "
+              f"matched cell yield {best['metrics'].get('hifi_yield_gb')} Gb.")
+    return best
+
+
+def load_all_demux(paths, cells):
+    demuxes, seen = [], set()
+    for path in paths:
+        d = load_demux(path)
+        key = d["movie"] or d["file"]
+        if key in seen:
+            continue
+        seen.add(key)
+        if not d["rows"]:
+            print(f"WARNING: {d['file']}: no barcode rows, skipped.")
+            continue
+        d["cell"] = match_demux(d, cells)
+        if d["cell"]:
+            print(f"Demux {d['file']} -> {d['cell']['run_name']} {d['cell']['well']} "
+                  f"({d['cell']['sample_name']}, SMRT Cell {d['cell']['cell_id']})")
+        else:
+            print(f"WARNING: {d['file']}: no matching acquisition found; shown as unmatched.")
+        demuxes.append(d)
+    taken = {}
+    for d in demuxes:
+        if d["cell"]:
+            taken.setdefault(id(d["cell"]), []).append(d["file"])
+    for files in taken.values():
+        if len(files) > 1:
+            print(f"WARNING: several barcode files matched the same acquisition: {', '.join(files)}")
+    order = {id(c): i for i, c in enumerate(cells)}
+    demuxes.sort(key=lambda d: order.get(id(d["cell"]), len(cells)))
+    return demuxes
 
 
 # Group name for cells without a sample name (never the run name, which
@@ -587,6 +744,184 @@ def render_table_legend():
 
 
 # ---------------------------------------------------------------------------
+# DEMUX TABLE: one <tbody> per acquisition, one row per barcode
+# ---------------------------------------------------------------------------
+
+# (key, label, decimals, data bar, CSV column(s)); text columns have decimals
+# None. Short labels keep the table narrow; the CSV gets the full names.
+DEMUX_COLUMNS = [
+    ("acq",        "Acquisition",  None, False, "Run Name|Well|SMRT Cell"),
+    ("bio_sample", "Bio Sample",   None, False, None),
+    ("barcode",    "Barcode",      None, False, None),
+    ("bc_quality", "BC Quality",   1,    False, "Barcode Quality"),
+    ("reads",      "HiFi Reads",   0,    True,  None),
+    ("reads_pct",  "Reads %",      1,    False, "Reads (%)"),
+    ("mean_len",   "Mean Length",  0,    False, "Mean Length (bp)"),
+    ("qv",         "Median QV",    0,    False, None),
+    ("yield_gb",   "Yield (Gb)",   2,    True,  "HiFi Yield (Gb)"),
+]
+DEMUX_SUM_KEYS = {"reads", "reads_pct", "yield_gb"}
+
+
+def _demux_ident(d):
+    c = d["cell"]
+    if c is None:
+        return {"run_name": "(unmatched)", "well": "", "cell_id": "", "sample": ""}
+    return {"run_name": c["run_name"], "well": c["well"], "cell_id": c["cell_id"],
+            "sample": c["sample_name"]}
+
+
+def _demux_label(d):
+    return d["cell"]["label"] if d["cell"] else d["file"]
+
+
+def barcode_cv(rows):
+    """Coefficient of variation (%) of reads across barcoded samples."""
+    vals = [r["reads"] for r in rows if r["barcoded"] and r["reads"] is not None]
+    if len(vals) < 2:
+        return None
+    mean = sum(vals) / len(vals)
+    sd = (sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
+    return 100 * sd / mean if mean else None
+
+
+def render_demux_header():
+    ths = []
+    for key, label, dec, _bar, csv_cols in DEMUX_COLUMNS:
+        num = dec is not None
+        attrs = [f'data-type="{"number" if num else "text"}"']
+        if num:
+            attrs.append('style="text-align:right"')
+        if csv_cols:
+            attrs.append(f'data-csv-cols="{_html_escape(csv_cols)}"')
+        if key == "reads_pct":
+            attrs.append(tip_attr(tip_html("Reads %", text="Share of the acquisition's HiFi reads.")))
+        elif key == "bc_quality":
+            attrs.append(tip_attr(tip_html("Barcode Quality", text="Mean barcode score (0-100).")))
+        ths.append(f'<th {" ".join(attrs)}>{label}</th>')
+    return "".join(ths)
+
+
+def render_demux_bodies(demuxes):
+    maxes = {key: max((r[key] or 0 for d in demuxes for r in d["rows"]), default=0)
+             for key, _l, _d, bar, _c in DEMUX_COLUMNS if bar}
+    bodies = []
+    for d in demuxes:
+        ident = _demux_ident(d)
+        color = d["cell"]["colors"]["sample"] if d["cell"] else "#cbd5e0"
+        rows = []
+        acq_csv = _html_escape("|".join(ident[k] for k in ("run_name", "well", "cell_id")))
+        acq_tip = tip_attr(tip_html(_html_escape(_demux_label(d)), [
+            (None, "Run", _html_escape(ident["run_name"])),
+            (None, "Well", _html_escape(ident["well"] or "-")),
+            (None, "SMRT Cell", _html_escape(ident["cell_id"] or "-")),
+            (None, "Sample", _html_escape(ident["sample"] or "-")),
+        ], _html_escape(d["file"])))
+        for r in d["rows"]:
+            tds = []
+            for i, (key, _label, dec, bar, _csv) in enumerate(DEMUX_COLUMNS):
+                val = r.get(key)
+                styles = []
+                cls = extra = ""
+                if key == "acq":
+                    cls = ' class="color-stripe"'
+                    styles.append(f"box-shadow:inset 4px 0 0 {color},inset -1px 0 0 #e2e8f0")
+                    extra = f' data-csv="{acq_csv}" {acq_tip}'
+                    sub = " &middot; ".join(_html_escape(v) for v in (ident["sample"], ident["cell_id"]) if v)
+                    content = f'{_html_escape(_demux_label(d))}<div class="acq-sub">{sub}</div>'
+                    style = f' style="{";".join(styles)}"'
+                    tds.append(f'<td{cls}{style}{extra}>{content}</td>')
+                    continue
+                if dec is None:
+                    content, data_value = _html_escape(val or ""), _html_escape(val or "")
+                else:
+                    styles.append("text-align:right")
+                    content = _fmt_number(dec, val)
+                    if key == "qv" and val is not None:
+                        content = f"Q{content}"
+                    data_value = "" if val is None else repr(val)
+                    if bar and val is not None and maxes[key]:
+                        content += (f'<div class="bar-track"><div class="bar-fill" '
+                                    f'style="width:{round(100 * val / maxes[key])}%"></div></div>')
+                style = f' style="{";".join(styles)}"' if styles else ""
+                tds.append(f'<td{cls}{style} data-value="{data_value}"{extra}>{content}</td>')
+            row_cls = "demux-row" + ("" if r["barcoded"] else " unbarcoded")
+            rows.append(f'    <tr class="{row_cls}">' + "".join(tds) + "</tr>")
+
+        n_bc = sum(r["barcoded"] for r in d["rows"])
+        cv = barcode_cv(d["rows"])
+        cv_text = "" if cv is None else f" &middot; CV {cv:.0f}%"
+        tds = []
+        for i, (key, _label, dec, _bar, _csv) in enumerate(DEMUX_COLUMNS):
+            if i == 0:
+                tds.append(f'<td class="sum-label" ' + tip_attr(tip_html(
+                    "Subtotal", text="CV: coefficient of variation of HiFi reads across the "
+                                     "barcoded samples (lower is more even).")) +
+                           f'>Subtotal <span class="sub">{n_bc} barcode{"" if n_bc == 1 else "s"}{cv_text}</span></td>')
+            elif key in DEMUX_SUM_KEYS:
+                total = sum(r[key] or 0 for r in d["rows"])
+                tds.append(f'<td style="text-align:right">{_fmt_number(dec, total)}</td>')
+            else:
+                tds.append("<td></td>")
+        rows.append('    <tr class="subtotal">' + "".join(tds) + "</tr>")
+        bodies.append(f'  <tbody class="run-group">\n' + "\n".join(rows) + "\n  </tbody>")
+    return "\n".join(bodies)
+
+
+def build_demux_payload(demuxes):
+    groups = []
+    for d in demuxes:
+        ident = _demux_ident(d)
+        groups.append({
+            "label": _demux_label(d), "run": ident["run_name"], "well": ident["well"],
+            "cellId": ident["cell_id"], "sample": ident["sample"],
+            "color": d["cell"]["colors"]["sample"] if d["cell"] else "#94a3b8",
+            "rows": [{"name": r["bio_sample"] or r["barcode"], "barcode": r["barcode"],
+                      "barcoded": r["barcoded"],
+                      "metrics": {k: r[k] for k in ("reads", "reads_pct", "yield_gb",
+                                                    "mean_len", "qv", "bc_quality")}}
+                     for r in d["rows"]],
+        })
+    metrics = [
+        {"key": "reads",      "label": "HiFi Reads",                  "decimals": 0, "even": True},
+        {"key": "yield_gb",   "label": "HiFi Yield (Gb)",             "decimals": 2, "even": True},
+        {"key": "reads_pct",  "label": "Reads (% of acquisition)",    "decimals": 1, "even": True},
+        {"key": "mean_len",   "label": "HiFi Read Length (mean, bp)", "decimals": 0},
+        {"key": "qv",         "label": "HiFi Read Quality (median, QV)", "decimals": 0},
+        {"key": "bc_quality", "label": "Barcode Quality",             "decimals": 1},
+    ]
+    return {"groups": groups, "metrics": metrics}
+
+
+def render_demux_section(demuxes):
+    if not demuxes:
+        return ""
+    n_rows = sum(len(d["rows"]) for d in demuxes)
+    iframe = _render_iframe(DEMUX_IFRAME, build_demux_payload(demuxes), "Demultiplexing")
+    n_unmatched = sum(d["cell"] is None for d in demuxes)
+    unmatched = (f" {n_unmatched} file{'' if n_unmatched == 1 else 's'} could not be matched to an "
+                 "acquisition of the run-qc-export file(s) and "
+                 f"{'is' if n_unmatched == 1 else 'are'} shown as \"(unmatched)\"." if n_unmatched else "")
+    return f"""\
+<div class="section-head">
+  <h3>Demultiplexing</h3>
+  <button class="btn" onclick="downloadTableCsv('demux-table', 'demux')">Download CSV</button>
+</div>
+<div class="table-wrap">
+<table id="demux-table">
+  <thead><tr>{render_demux_header()}</tr></thead>
+{render_demux_bodies(demuxes)}
+</table>
+</div>
+<p class="table-note">One row per barcode, grouped by acquisition; barcode files are matched to
+acquisitions by instrument, movie date and sample name in the file name, then by HiFi yield.{unmatched}</p>
+<div class="plot-container">
+  <iframe srcdoc="{iframe}" height="{150 + 24 * n_rows + 34 * len(demuxes)}" frameborder="0" scrolling="no"></iframe>
+</div>
+"""
+
+
+# ---------------------------------------------------------------------------
 # CHART DATA
 # ---------------------------------------------------------------------------
 
@@ -673,6 +1008,14 @@ HTML_TEMPLATE = """\
      box-shadow:inset -1px 0 0 #e2e8f0;}
   #cell-table tbody td:first-child{background:#fff;}
   #cell-table tr.subtotal td:first-child{background:#f8fafc;}
+  #demux-table th{cursor:default;}
+  #demux-table th:hover{background:#edf2f7;}
+  #demux-table th:first-child,#demux-table td:first-child{position:sticky;left:0;z-index:2;}
+  #demux-table tbody td:first-child{background:#fff;}
+  #demux-table tr.subtotal td:first-child{background:#f8fafc;}
+  #demux-table tr.unbarcoded td{color:#94a3b8;}
+  #demux-table .acq-sub{font-size:11.5px;color:#718096;line-height:1.3;}
+  #demux-table tr.unbarcoded .bar-fill{background:#cbd5e0;}
   .table-note{font-size:12px;color:#718096;margin:6px 0 8px;}
   tr:hover td{background-color:rgba(59,130,246,.04);}
   .bar-track{position:absolute;bottom:4px;left:10px;right:10px;height:3px;
@@ -918,6 +1261,7 @@ HTML_TEMPLATE = """\
 </div>
 
 %%REUSE_SECTION%%
+%%DEMUX_SECTION%%
 <h3>Metric Correlation</h3>
 <div class="plot-container">
   <iframe srcdoc="%%SCATTER_IFRAME%%" height="600" frameborder="0" scrolling="no"></iframe>
@@ -1508,6 +1852,110 @@ REUSE_IFRAME = """\
 </html>"""
 
 
+# ---------------------------------------------------------------------------
+# IFRAME 5: DEMULTIPLEXING -- a metric per barcode, grouped by acquisition
+# ---------------------------------------------------------------------------
+
+DEMUX_IFRAME = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Demultiplexing</title>
+%%CHART_HEAD%%
+%%IFRAME_EXTRA%%
+</head>
+<body>
+  <div id="chart-container">
+    <h2 id="chart-title"></h2>
+%%EXPORT_BUTTONS%%
+    <div class="controls">
+      <label for="metric-select">Metric</label>
+      <select id="metric-select"></select>
+    </div>
+    <div id="chart"></div>
+    <div class="tooltip" id="tooltip"></div>
+  </div>
+  <script>
+    const payload = %%PLOT_DATA%%;
+    const groups = payload.groups;
+    const metrics = payload.metrics;
+    const select = d3.select('#metric-select');
+    fillSelect(select, metrics);
+
+    function build() {
+      d3.select('#chart').selectAll('*').remove();
+      const key = select.property('value');
+      const meta = metrics.find(m => m.key === key) || {};
+      document.getElementById('chart-title').textContent = `${meta.label || key} per Barcode`;
+      const fmt = d3.format(',.' + (meta.decimals ?? 2) + 'f');
+
+      const totalW = chartWidth();
+      const labelW = Math.min(170, totalW * 0.3), valueW = 70, rowH = 24, headH = 34, axisH = 30;
+      const W = Math.max(60, totalW - labelW - valueW);
+      const H = groups.reduce((h, g) => h + headH + g.rows.length * rowH, 0);
+      const svg = d3.select('#chart').append('svg').attr('width', totalW).attr('height', H + axisH)
+        .append('g').attr('transform', `translate(${labelW},0)`);
+      const max = d3.max(groups, g => d3.max(g.rows, r => r.metrics[key])) || 1;
+      const x = d3.scaleLinear().domain([0, max * 1.04]).range([0, W]);
+      const ticks = Math.max(2, Math.floor(W / 80));
+
+      svg.append('g').attr('class', 'grid').attr('transform', `translate(0,${H})`)
+         .call(d3.axisBottom(x).ticks(ticks).tickSize(-H).tickFormat(''));
+      svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${H})`)
+         .call(d3.axisBottom(x).ticks(ticks).tickFormat(d3.format('.3~s')));
+
+      let oy = 0;
+      groups.forEach(g => {
+        const head = svg.append('text').attr('x', -labelW).attr('y', oy + headH - 10)
+          .style('font-size', '12.5px').style('fill', '#333');
+        head.append('tspan').style('font-weight', '600').text(g.label);
+        if (g.sample) head.append('tspan').style('fill', '#718096').text(`  ${g.sample} · ${g.cellId}`);
+        oy += headH;
+
+        // Even split: what each barcode would get if reads were spread equally.
+        const bc = g.rows.filter(r => r.barcoded && r.metrics[key] != null);
+        if (meta.even && bc.length > 1) {
+          const even = d3.sum(bc, r => r.metrics[key]) / bc.length;
+          svg.append('line').attr('x1', x(even)).attr('x2', x(even))
+             .attr('y1', oy - 2).attr('y2', oy + bc.length * rowH + 2)
+             .attr('stroke', '#475569').attr('stroke-dasharray', '4,3')
+             .append('title').text(`Even split: ${fmt(even)}`);
+        }
+
+        g.rows.forEach((r, i) => {
+          const y = oy + i * rowH, v = r.metrics[key];
+          svg.append('text').attr('x', -8).attr('y', y + rowH / 2).attr('dy', '0.35em')
+             .attr('text-anchor', 'end').style('font-size', '11.5px')
+             .style('fill', r.barcoded ? '#333' : '#94a3b8').text(r.name);
+          if (v == null) return;
+          svg.append('rect').attr('class', 'bar').attr('x', 0).attr('y', y + 4)
+             .attr('width', x(v)).attr('height', rowH - 8).attr('rx', 2)
+             .attr('fill', r.barcoded ? g.color : '#cbd5e0')
+             .on('mousemove', event => showTooltip(event, tipHtml(escTip(r.name), [
+               [r.barcoded ? g.color : '#cbd5e0', meta.label, fmt(v)],
+               [null, 'Barcode', escTip(r.barcode)],
+               [null, 'Acquisition', escTip(g.label)],
+               [null, 'Sample', escTip(g.sample || '-')],
+             ])))
+             .on('mouseout', hideTooltip);
+          svg.append('text').attr('class', 'legend-text').attr('x', x(v) + 6)
+             .attr('y', y + rowH / 2).attr('dy', '0.35em').attr('fill', '#4a5568')
+             .text(key === 'reads' && v >= 1e6 ? (v / 1e6).toFixed(2) + ' M' : fmt(v));
+        });
+        oy += g.rows.length * rowH;
+      });
+      fitFrame();
+    }
+
+    select.on('change', build);
+    select.property('value', metrics[0].key);
+    build();
+    onResize(build);
+  </script>
+</body>
+</html>"""
+
+
 def _render_iframe(template, payload, title):
     return render_chart_iframe(template, payload, title, iframe_extra=_IFRAME_EXTRA)
 
@@ -1516,12 +1964,13 @@ def _render_iframe(template, payload, title):
 # MAIN GENERATION FUNCTION
 # ---------------------------------------------------------------------------
 
-def generate_report(files, title, out_path):
+def generate_report(files, title, out_path, demux_files=()):
     cells = load_all_cells(files)
     if not cells:
         sys.exit("ERROR: No SMRT Cell rows found in the given file(s).")
 
     assign_colors(cells)
+    demuxes = load_all_demux(demux_files, cells)
 
     n_runs = len({c["run_id"] or c["run_name"] for c in cells})
     n_smrt = len({c["cell_id"] for c in cells if c["cell_id"]})
@@ -1569,6 +2018,7 @@ def generate_report(files, title, out_path):
         sample_iframe=sample_iframe,
         sample_iframe_h=170 + 36 * n_samples,
         reuse_section=reuse_section,
+        demux_section=render_demux_section(demuxes),
         filter_run_options=render_filter_options(cells, "run_name"),
         filter_cell_options=render_filter_options(cells, "cell_id"),
         filter_sample_options=render_filter_options(cells, "sample_name"),
@@ -1596,19 +2046,25 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("files", nargs="*", metavar="FILE",
-                        help="run-qc-export.csv file(s). Auto-discovered if omitted.")
+                        help="run-qc-export.csv file(s), and optionally barcodes.summary.csv "
+                             "file(s) (recognised by their columns). Auto-discovered if omitted.")
+    parser.add_argument("--demux", nargs="+", default=[], metavar="FILE",
+                        help="SMRT Link *.barcodes.summary.csv file(s) for the Demultiplexing section")
     parser.add_argument("--title", default="HiFi Sequencing Report",
                         help="Report title (default: 'HiFi Sequencing Report')")
     parser.add_argument("--out", default="hifi-report.html",
                         help="Output HTML file (default: hifi-report.html)")
     args = parser.parse_args()
 
-    files = sorted(args.files or glob.glob("*qc-export*.csv"))
+    given = args.files or (glob.glob("*qc-export*.csv") + glob.glob("*barcodes.summary*.csv"))
+    demux_files = list(args.demux) + [f for f in given if is_demux_csv(f)]
+    files = sorted(f for f in given if f not in demux_files)
     if not files:
         sys.exit("ERROR: No input files found. Pass file(s) explicitly or place "
                  "*qc-export*.csv files in the current directory.")
 
-    generate_report(files=files, title=args.title, out_path=args.out)
+    generate_report(files=files, title=args.title, out_path=args.out,
+                    demux_files=sorted(demux_files))
 
 
 if __name__ == "__main__":
