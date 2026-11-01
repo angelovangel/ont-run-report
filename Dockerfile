@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 rocker/shiny:latest
+FROM --platform=linux/amd64 rocker/shiny:4.6.1
 
 # Install system libraries required by R packages + Python for generate-ont-report.py
 RUN apt-get update && apt-get install -y --no-install-recommends \
