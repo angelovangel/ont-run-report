@@ -728,8 +728,9 @@ def render_table_body(cells):
 
 
 def render_filter_options(cells, key):
+    """Checkbox list for one multi-select filter dropdown."""
     values = sorted({rec[key] for rec in cells if rec[key]})
-    return "".join(f'<option value="{_html_escape(v)}">{_html_escape(v)}</option>'
+    return "".join(f'<label><input type="checkbox" value="{_html_escape(v)}">{_html_escape(v)}</label>'
                    for v in values)
 
 
@@ -896,7 +897,11 @@ def render_demux_bodies(demuxes):
             else:
                 tds.append("<td></td>")
         rows.append('    <tr class="subtotal">' + "".join(tds) + "</tr>")
-        bodies.append(f'  <tbody class="run-group">\n' + "\n".join(rows) + "\n  </tbody>")
+        # Identity of the acquisition, for the Acquisition Summary filters.
+        ident_attrs = (f'data-run="{_html_escape(ident["run_name"])}" '
+                       f'data-cell="{_html_escape(ident["cell_id"])}" '
+                       f'data-sample="{_html_escape(ident["sample"])}"')
+        bodies.append(f'  <tbody class="run-group" {ident_attrs}>\n' + "\n".join(rows) + "\n  </tbody>")
     return "\n".join(bodies)
 
 
@@ -1107,6 +1112,20 @@ HTML_TEMPLATE = """\
   .filter-bar label{font-size:12.5px;font-weight:600;color:#555;}
   .filter-bar select{padding:5px 10px;font-size:12.5px;border:1px solid #cbd5e0;
                       border-radius:6px;background:#f8fafc;color:#2d3748;cursor:pointer;}
+  /* Multi-select filter: a dropdown of checkboxes; none checked = all */
+  .ms{position:relative;font-size:12.5px;}
+  .ms summary{list-style:none;padding:5px 26px 5px 10px;border:1px solid #cbd5e0;border-radius:6px;
+              background:#f8fafc;color:#2d3748;cursor:pointer;min-width:90px;max-width:220px;
+              overflow:hidden;text-overflow:ellipsis;white-space:nowrap;position:relative;}
+  .ms summary::-webkit-details-marker{display:none;}
+  .ms summary::after{content:"\\25BE";position:absolute;right:9px;color:#718096;}
+  .ms.active summary{border-color:#3b82f6;background:#eff6ff;}
+  .ms-list{position:absolute;z-index:20;top:calc(100% + 4px);left:0;min-width:100%;max-height:300px;
+           overflow-y:auto;background:#fff;border:1px solid #cbd5e0;border-radius:6px;
+           box-shadow:0 4px 14px rgba(0,0,0,.12);padding:4px 0;}
+  .ms-list label{display:flex;align-items:center;gap:7px;padding:4px 12px;white-space:nowrap;
+                 font-weight:400;color:#2d3748;cursor:pointer;}
+  .ms-list label:hover{background:#edf2f7;}
   .row-count{font-size:12.5px;color:#718096;margin-left:auto;}
   .plot-container{margin:20px 0;background:#fff;border-radius:8px;
                    box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e2e8f0;overflow:hidden;}
@@ -1142,12 +1161,13 @@ HTML_TEMPLATE = """\
   <button class="btn" onclick="downloadTableCsv('cell-table', 'cells')" data-tip="<div class='tt-text'>Rows hidden by the filters are left out.</div>">Download CSV</button>
 </div>
 <div class="filter-bar">
-  <label for="filter-run">Run Name</label>
-  <select id="filter-run"><option value="">All</option>%%FILTER_RUN_OPTIONS%%</select>
-  <label for="filter-cell">SMRT Cell</label>
-  <select id="filter-cell"><option value="">All</option>%%FILTER_CELL_OPTIONS%%</select>
-  <label for="filter-sample">Sample</label>
-  <select id="filter-sample"><option value="">All</option>%%FILTER_SAMPLE_OPTIONS%%</select>
+  <label>Run Name</label>
+  <details class="ms" id="filter-run" data-key="run"><summary>All</summary><div class="ms-list">%%FILTER_RUN_OPTIONS%%</div></details>
+  <label>SMRT Cell</label>
+  <details class="ms" id="filter-cell" data-key="cell"><summary>All</summary><div class="ms-list">%%FILTER_CELL_OPTIONS%%</div></details>
+  <label>Sample</label>
+  <details class="ms" id="filter-sample" data-key="sample"><summary>All</summary><div class="ms-list">%%FILTER_SAMPLE_OPTIONS%%</div></details>
+  <button class="btn" id="filter-clear" type="button">Clear filters</button>
   <label for="color-by-select">Color by</label>
   <select id="color-by-select">
     <option value="sample">Sample</option>
@@ -1166,7 +1186,7 @@ HTML_TEMPLATE = """\
   </tfoot>
 </table>
 </div>
-<p class="table-note">%%TABLE_LEGEND%%<br>Each row is one acquisition: one use of a SMRT Cell, in a well of a run. Subtotals and the Total row count only the acquisitions shown by the filters.</p>
+<p class="table-note">%%TABLE_LEGEND%%<br>Each row is one acquisition: one use of a SMRT Cell, in a well of a run. Subtotals and the Total row count only the acquisitions shown by the filters. The filters also apply to every chart and to the Demultiplexing section.</p>
 <script>
 %%TABLE_CSV_JS%%
 
@@ -1235,22 +1255,56 @@ HTML_TEMPLATE = """\
       `<strong>Total</strong> <span class="sub">${all.length} acquisition${all.length === 1 ? '' : 's'}</span>`;
   }
 
+  // Filters: {run: [...], cell: [...], sample: [...]}; an empty list means all.
+  // The chart iframes read it with parent.currentTableFilter() when they start
+  // and are sent it with setFilter() whenever it changes.
+  const FILTER_IDS = ['filter-run', 'filter-cell', 'filter-sample'];
+
+  function currentTableFilter() {
+    const f = {};
+    FILTER_IDS.forEach(id => {
+      const ms = document.getElementById(id);
+      f[ms.dataset.key] = Array.from(ms.querySelectorAll('input:checked')).map(i => i.value);
+    });
+    return f;
+  }
+  const matchesFilter = (f, el) =>
+    ['run', 'cell', 'sample'].every(k => !f[k].length || f[k].includes(el.dataset[k]));
+
+  function updateFilterLabels() {
+    FILTER_IDS.forEach(id => {
+      const ms = document.getElementById(id);
+      const checked = Array.from(ms.querySelectorAll('input:checked')).map(i => i.value);
+      ms.querySelector('summary').textContent =
+        checked.length === 0 ? 'All' : checked.length === 1 ? checked[0] : `${checked.length} selected`;
+      ms.classList.toggle('active', checked.length > 0);
+    });
+  }
+
+  // Charts and the demux table (both further down the page).
+  function applyFilterElsewhere(f) {
+    document.querySelectorAll('#demux-table tbody.run-group').forEach(tb => {
+      tb.style.display = matchesFilter(f, tb) ? '' : 'none';
+    });
+    document.querySelectorAll('.plot-container iframe').forEach(fr => {
+      try { fr.contentWindow.setFilter && fr.contentWindow.setFilter(f); } catch (e) {}
+    });
+  }
+
   function applyFilters() {
-    const run = document.getElementById('filter-run').value;
-    const cell = document.getElementById('filter-cell').value;
-    const sample = document.getElementById('filter-sample').value;
+    const f = currentTableFilter();
+    updateFilterLabels();
     const rows = document.querySelectorAll('#cell-table ' + CELL_ROWS);
     let shown = 0;
     rows.forEach(r => {
-      const match = (!run || r.dataset.run === run) &&
-                    (!cell || r.dataset.cell === cell) &&
-                    (!sample || r.dataset.sample === sample);
+      const match = matchesFilter(f, r);
       r.style.display = match ? '' : 'none';
       if (match) shown++;
     });
     document.getElementById('row-count').textContent = `Showing ${shown} of ${rows.length} acquisitions`;
     updateSums();
     applyDataBars();
+    applyFilterElsewhere(f);
   }
 
   const COLOR_ATTR = { sample: 'colorSample', run: 'colorRun', cell: 'colorCell' };
@@ -1339,9 +1393,21 @@ HTML_TEMPLATE = """\
     });
   }
 
-  ['filter-run', 'filter-cell', 'filter-sample'].forEach(id =>
-    document.getElementById(id).addEventListener('change', applyFilters));
+  FILTER_IDS.forEach(id => document.getElementById(id).addEventListener('change', applyFilters));
+  document.getElementById('filter-clear').addEventListener('click', () => {
+    document.querySelectorAll('.ms input:checked').forEach(i => { i.checked = false; });
+    applyFilters();
+  });
+  // One dropdown open at a time; a click elsewhere closes it.
+  document.querySelectorAll('.ms').forEach(ms => ms.addEventListener('toggle', () => {
+    if (ms.open) document.querySelectorAll('.ms[open]').forEach(o => { if (o !== ms) o.open = false; });
+  }));
+  document.addEventListener('click', e => {
+    document.querySelectorAll('.ms[open]').forEach(o => { if (!o.contains(e.target)) o.open = false; });
+  });
   applyFilters();
+  // The demux table and later charts are parsed after this script.
+  document.addEventListener('DOMContentLoaded', () => applyFilterElsewhere(currentTableFilter()));
 </script>
 
 <h3>Metric by Acquisition</h3>
@@ -1393,6 +1459,27 @@ _IFRAME_EXTRA = """\
       return {right: 16, below: true, cols, height: Math.ceil(n / cols) * 22 + 8};
     }
 
+    // The report's Acquisition Summary filters: {run, cell, sample} lists,
+    // empty = all. Read from the parent on start, then pushed via setFilter().
+    let tableFilter = {run: [], cell: [], sample: []};
+    try { if (parent.currentTableFilter) tableFilter = parent.currentTableFilter(); } catch (e) {}
+    // Before the chart's own script has run, build() will pick the filter up.
+    window.setFilter = f => { tableFilter = f; if (document.readyState !== 'loading') build(); };
+    // Works for chart records and demux groups (both have run, cellId, sample).
+    const inFilter = r => (!tableFilter.run.length || tableFilter.run.includes(r.run)) &&
+                          (!tableFilter.cell.length || tableFilter.cell.includes(r.cellId)) &&
+                          (!tableFilter.sample.length || tableFilter.sample.includes(r.sample));
+    // Legend entries for the groups that pass the filters.
+    function legendGroups() {
+      const present = new Set(records.filter(inFilter).map(groupNameOf));
+      return (groups[colorMode] || []).filter(g => present.has(g.name));
+    }
+    function noDataNote() {
+      d3.select('#chart').append('p').style('text-align', 'center').style('color', '#718096')
+        .style('padding', '40px 0').text('No acquisitions match the filters.');
+      fitFrame();
+    }
+
     function groupNameOf(r) {
       if (colorMode === 'run') return r.run || 'Unknown';
       if (colorMode === 'cell') return r.cellId || 'Unknown';
@@ -1402,7 +1489,7 @@ _IFRAME_EXTRA = """\
     function drawGroupLegend(svg, W, H, legend, axisSpace, shape) {
       const g = svg.append('g').attr('transform',
         legend.below ? `translate(${-40},${H + axisSpace})` : `translate(${W + 14},0)`);
-      (groups[colorMode] || []).forEach((grp, i) => {
+      legendGroups().forEach((grp, i) => {
         const hidden = hiddenGroups.has(grp.name);
         const pos = legend.below
           ? [(i % legend.cols) * 180, Math.floor(i / legend.cols) * 22 + 6]
@@ -1531,7 +1618,7 @@ BAR_CHART_IFRAME = """\
       document.getElementById('chart-title').textContent = meta.label || metricKey;
 
       const totalW = chartWidth();
-      const legend = groupLegendLayout(totalW, (groups[colorMode] || []).length);
+      const legend = groupLegendLayout(totalW, legendGroups().length);
       const margin = {top: 20, right: legend.right, bottom: 84, left: 70};
       const W = totalW - margin.left - margin.right;
       const H = 360;
@@ -1539,7 +1626,8 @@ BAR_CHART_IFRAME = """\
 
       const data = records.filter(r => r.metrics[metricKey] !== null &&
                                        r.metrics[metricKey] !== undefined &&
-                                       !hiddenGroups.has(groupNameOf(r)));
+                                       inFilter(r) && !hiddenGroups.has(groupNameOf(r)));
+      if (!data.length) { d3.select('#chart').selectAll('*').remove(); return noDataNote(); }
 
       const x = d3.scaleBand().domain(data.map(d => d.label)).range([0, W]).padding(0.3);
       const y = d3.scaleLinear()
@@ -1642,7 +1730,7 @@ SCATTER_IFRAME = """\
         `${yMeta.label || yKey} vs ${xMeta.label || xKey}`;
 
       const totalW = chartWidth();
-      const legend = groupLegendLayout(totalW, (groups[colorMode] || []).length);
+      const legend = groupLegendLayout(totalW, legendGroups().length);
       const margin = {top: 20, right: legend.right, bottom: 60, left: 70};
       const W = totalW - margin.left - margin.right;
       const H = 460 - margin.top - margin.bottom;
@@ -1651,7 +1739,8 @@ SCATTER_IFRAME = """\
       const data = records.filter(r =>
         r.metrics[xKey] !== null && r.metrics[xKey] !== undefined &&
         r.metrics[yKey] !== null && r.metrics[yKey] !== undefined &&
-        !hiddenGroups.has(groupNameOf(r)));
+        inFilter(r) && !hiddenGroups.has(groupNameOf(r)));
+      if (!data.length) { d3.select('#chart').selectAll('*').remove(); return noDataNote(); }
 
       const xExtent = d3.extent(data, d => d.metrics[xKey]);
       const yExtent = d3.extent(data, d => d.metrics[yKey]);
@@ -1745,25 +1834,28 @@ SAMPLE_IFRAME = """\
 
     // One bar per sample and panel; each acquisition (one use of a SMRT
     // Cell) is a segment, in run order, with its [x0, x1] per panel.
-    const samples = [];
-    const bySample = new Map();
-    payload.records.forEach(r => {
-      const name = r.sample || 'Unknown';
-      if (!bySample.has(name)) {
-        const entry = {name, color: r.colors.sample, cells: [], totals: {}};
-        PANELS.forEach(p => { entry.totals[p.key] = 0; });
-        bySample.set(name, entry);
-        samples.push(entry);
-      }
-      const entry = bySample.get(name);
-      const seg = {};
-      PANELS.forEach(p => {
-        const v = r.metrics[p.key] || 0;
-        seg[p.key] = [entry.totals[p.key], entry.totals[p.key] + v];
-        entry.totals[p.key] += v;
+    function aggregate(records) {
+      const samples = [];
+      const bySample = new Map();
+      records.forEach(r => {
+        const name = r.sample || 'Unknown';
+        if (!bySample.has(name)) {
+          const entry = {name, color: r.colors.sample, cells: [], totals: {}};
+          PANELS.forEach(p => { entry.totals[p.key] = 0; });
+          bySample.set(name, entry);
+          samples.push(entry);
+        }
+        const entry = bySample.get(name);
+        const seg = {};
+        PANELS.forEach(p => {
+          const v = r.metrics[p.key] || 0;
+          seg[p.key] = [entry.totals[p.key], entry.totals[p.key] + v];
+          entry.totals[p.key] += v;
+        });
+        entry.cells.push({r, seg});
       });
-      entry.cells.push({r, seg});
-    });
+      return samples;
+    }
 
     function segmentTip(s, d, panel) {
       const [x0, x1] = d.seg[panel.key];
@@ -1777,6 +1869,8 @@ SAMPLE_IFRAME = """\
 
     function build() {
       d3.select('#chart').selectAll('*').remove();
+      const samples = aggregate(payload.records.filter(inFilter));
+      if (!samples.length) return noDataNote();
       const totalW = chartWidth();
       const narrow = totalW < NARROW;   // panels stacked instead of side by side
       const labelW = 136, gap = 44, valueW = 74, titleH = 22, axisH = 30;
@@ -1891,14 +1985,15 @@ REUSE_IFRAME = """\
         `${meta.label || key} by Acquisition (multi-use cells)`;
 
       const totalW = chartWidth();
-      const legend = groupLegendLayout(totalW, groups.cell.length);
+      const legend = groupLegendLayout(totalW, legendGroups().length);
       const margin = {top: 20, right: legend.right, bottom: 50, left: 70};
       const W = totalW - margin.left - margin.right;
       const H = 380 - margin.top - margin.bottom;
       const svg = appendSvg(totalW, margin, H, legend, 56);
 
       const data = records.filter(r => r.metrics[key] != null && r.metrics.acquisition_no != null &&
-                                       !hiddenGroups.has(r.cellId));
+                                       inFilter(r) && !hiddenGroups.has(r.cellId));
+      if (!data.length) { d3.select('#chart').selectAll('*').remove(); return noDataNote(); }
       const lines = d3.groups(data, r => r.cellId)
         .map(([cell, rs]) => [cell, rs.sort((a, b) => a.metrics.acquisition_no - b.metrics.acquisition_no)]);
       const maxAcq = d3.max(records, r => r.metrics.acquisition_no) || 1;
@@ -1980,17 +2075,19 @@ DEMUX_IFRAME = """\
       const meta = metrics.find(m => m.key === key) || {};
       document.getElementById('chart-title').textContent = `${meta.label || key} per Barcode`;
       const fmt = d3.format(',.' + (meta.decimals ?? 2) + 'f');
+      const shown = groups.filter(inFilter);
+      if (!shown.length) return noDataNote();
 
       const totalW = chartWidth();
       const labelW = Math.min(170, totalW * 0.3), valueW = 70, rowH = 24, headH = 34, axisH = 26;
       const W = Math.max(60, totalW - labelW - valueW);
-      const H = groups.reduce((h, g) => h + headH + g.rows.length * rowH + axisH, 0);
+      const H = shown.reduce((h, g) => h + headH + g.rows.length * rowH + axisH, 0);
       const svg = d3.select('#chart').append('svg').attr('width', totalW).attr('height', H)
         .append('g').attr('transform', `translate(${labelW},0)`);
       const ticks = Math.max(2, Math.floor(W / 80));
 
       let oy = 0;
-      groups.forEach(g => {
+      shown.forEach(g => {
         const head = svg.append('text').attr('x', -labelW).attr('y', oy + headH - 10)
           .style('font-size', '12.5px').style('fill', '#333');
         head.append('tspan').style('font-weight', '600').text(g.label);
